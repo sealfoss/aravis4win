@@ -3623,9 +3623,11 @@ arv_camera_gv_get_packet_size (ArvCamera *camera, GError **error)
  * Automatically determine the biggest packet size that can be used data
  * streaming, and set GevSCPSPacketSize value accordingly. This function relies
  * on the GevSCPSFireTestPacket feature. If this feature is not available, the
- * current packet size is kept. In both cases, the packet size never exceeds the
- * MTU of the host network interface the device is reached through, when the
- * operating system reports it.
+ * current packet size is kept. In both cases, when the operating system reports
+ * the MTU of the host network interface the device is reached through, the
+ * packet size does not exceed it, unless even the smallest packet size of the
+ * device is larger: no packet size fits, the smallest one is used, and a
+ * warning is logged.
  *
  * Returns: The packet size, in bytes.
  *

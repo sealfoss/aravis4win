@@ -102,11 +102,15 @@ the interface the device is reached through can't be received without
 fragmentation. When the operating system reports this MTU, the automatic packet
 size adjustment (done at stream creation, see
 [method@Aravis.Camera.gv_set_packet_size_adjustment], or by
-[method@Aravis.Camera.gv_auto_packet_size]) never selects a larger packet size,
-and lowers a larger current packet size to the MTU, even for devices that can't
-send test packets. The `never` adjustment mode
-(`--packet-size-adjustment=never` for `arv-camera-test`) keeps the packet size
-unchanged.
+[method@Aravis.Camera.gv_auto_packet_size]) selects a packet size not larger
+than the MTU, and lowers a larger current packet size to the largest valid one
+fitting in the MTU, even for devices that can't send test packets. If even the
+smallest packet size of the device is larger than the MTU, no packet size fits:
+the adjustment uses the smallest one, and logs a warning naming the MTU and this
+size (`--debug=device:1`, or `ARV_DEBUG=device:1`, shows it). The data packets
+are then likely to be dropped: increase the MTU of the interface. The `never`
+adjustment mode (`--packet-size-adjustment=never` for `arv-camera-test`) keeps
+the packet size unchanged.
 
 When frames fail with only their leader and trailer packets received, which is
 the usual symptom of data packets larger than the MTU of the host interface or

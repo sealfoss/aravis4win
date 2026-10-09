@@ -68,9 +68,16 @@ the TL vendor is the vendor of the producer. The device can also be opened with
 device id given by the producer. Control characters are removed from the ids.
 
 Producers don't always tell every string. A missing transport layer vendor is
-replaced by the producer file name without extension, a missing serial number by
-the GenTL device id in the Aravis device id, which then stays unique, and the
-other missing strings by empty strings.
+replaced by the producer file name without extension, and the other missing
+strings by empty strings, except the serial number: in the Aravis device ids, a
+missing serial number is replaced by `<producer>-<interface id>-<device id>`, the
+producer file name without extension and the GenTL ids of the interface and of
+the device. A GenTL device id is only unique in its interface, and a vendor may
+ship several producers. The device id given by the producer, which can also open
+the device, is not made unique: when several interfaces or producers have a
+device with this id, it opens one of them, which one is not defined. Copies of
+one producer with the same file name, in different folders, still share these
+ids.
 
 ## Producer loading
 

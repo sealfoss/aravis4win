@@ -60,6 +60,7 @@ gboolean        arv_uv_device_reset_stream_endpoint     (ArvUvDevice *device);
 guint           arv_uv_device_get_stream_packet_size    (ArvUvDevice *uv_device);
 guint           arv_uv_device_get_raw_io_maximum_transfer_size  (ArvUvDevice *uv_device);
 gboolean        arv_uv_device_set_raw_io                (ArvUvDevice *uv_device, gboolean enable);
+gboolean        arv_uv_device_get_raw_io                (ArvUvDevice *uv_device);
 void            arv_uv_device_disable_raw_io            (ArvUvDevice *uv_device);
 gboolean        arv_uv_device_clear_stream_halt         (ArvUvDevice *uv_device);
 gboolean        arv_uv_device_has_hotplug               (ArvUvDevice *uv_device);

@@ -8,10 +8,12 @@ for USB3 Vision cameras, and that it holds no GLib
 or GStreamer DLL: the plugin must use the GLib of the GStreamer installation
 it is loaded into. Then adds the licence texts and a README, and writes
 OUTPUT_DIR/aravis-VERSION[-gREVISION]-FLAVOUR.zip and its .sha256 file.
+The README links to the sources at SOURCE_URL/tree/REVISION: the workflows
+pass the repository they build, so that the zips of a fork name the fork.
 
 Usage: package-windows.py --builddir BUILD --destdir STAGE --flavour FLAVOUR
-                          [--revision SHA] [--release] [--libusb {hotplug,any,none}]
-                          [--output-dir DIR]
+                          [--revision SHA] [--source-url URL] [--release]
+                          [--libusb {hotplug,any,none}] [--output-dir DIR]
 """
 
 import argparse
@@ -26,6 +28,7 @@ import zipfile
 
 SOURCE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 API_VERSION = '0.10'
+UPSTREAM_URL = 'https://github.com/AravisProject/aravis'
 
 REQUIRED = [
     ('Aravis DLL', ['bin/aravis-{0}-*.dll', 'bin/libaravis-{0}-*.dll']),
@@ -72,7 +75,7 @@ Use
 {libusb_section}
 Licences and sources
   Aravis is released under the LGPL-2.1-or-later (licenses/aravis).
-  Source: https://github.com/AravisProject/aravis{source_ref}
+  Source: {source_url}{source_ref}
 {libusb_licence}"""
 
 REQUIREMENTS = {
@@ -135,6 +138,9 @@ def main():
     parser.add_argument('--destdir', required=True, help="directory given to 'meson install --destdir'")
     parser.add_argument('--flavour', required=True, help='package flavour, for example msvc-x86_64')
     parser.add_argument('--revision', help='git commit of the build')
+    parser.add_argument('--source-url', default=UPSTREAM_URL,
+                        help='repository that holds the revision, which the README links to as the source '
+                             '(default: %(default)s); CI passes its own, which may be a fork')
     parser.add_argument('--release', action='store_true', help='leave the revision out of the file name')
     parser.add_argument('--libusb', choices=['hotplug', 'any', 'none'], default='hotplug',
                         help='require libusb-1.0.dll built from subprojects/libusb.wrap with hotplug support '
@@ -192,6 +198,7 @@ def main():
         libusb_section=LIBUSB_SECTION.format(
             libusb_version=libusb_version, api=API_VERSION,
             hotplug=',\n  with Windows hotplug support (-Dlibusb:windows-hotplug=true)' if hotplug else '') if with_libusb else '',
+        source_url=args.source_url.rstrip('/'),
         source_ref='/tree/' + revision if revision else '',
         libusb_licence=LIBUSB_LICENCE.format(libusb_version=libusb_version) if with_libusb else '')
 

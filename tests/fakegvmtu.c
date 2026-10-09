@@ -337,6 +337,58 @@ never_adjust_test (void)
 	fixture_stop (&fixture);
 }
 
+/* An interface MTU below the smallest packet size of the device: no packet size fits in it. The adjustment lowers a
+ * larger packet size to the smallest one, keeps the smallest one, and warns each time. The warnings of the device
+ * category go to stderr. */
+
+#define LOW_MTU			200
+
+static void
+mtu_below_minimum_test (void)
+{
+	if (g_test_subprocess ()) {
+		Fixture fixture;
+		ArvStream *stream;
+		GError *error = NULL;
+		gint64 minimum, maximum;
+
+		g_assert_true (arv_debug_enable ("device:1"));
+
+		fixture_start (&fixture);
+		arv_network_set_loopback_mtu_override (LOW_MTU);
+
+		arv_camera_get_integer_bounds (fixture.camera, "GevSCPSPacketSize", &minimum, &maximum, &error);
+		g_assert_no_error (error);
+		g_assert_cmpint (minimum, >, LOW_MTU);
+
+		set_packet_size (fixture.camera, LARGE_PACKET_SIZE);
+		g_assert_cmpint (arv_camera_gv_auto_packet_size (fixture.camera, &error), ==, minimum);
+		g_assert_no_error (error);
+		g_assert_cmpint (arv_camera_gv_get_packet_size (fixture.camera, NULL), ==, minimum);
+
+		g_assert_cmpint (arv_camera_gv_auto_packet_size (fixture.camera, &error), ==, minimum);
+		g_assert_no_error (error);
+
+		/* Same at stream creation, with the default adjustment mode */
+		set_packet_size (fixture.camera, LARGE_PACKET_SIZE);
+		stream = arv_camera_create_stream (fixture.camera, NULL, NULL, NULL, &error);
+		g_assert_no_error (error);
+		g_assert_true (ARV_IS_STREAM (stream));
+		g_assert_cmpint (arv_camera_gv_get_packet_size (fixture.camera, NULL), ==, minimum);
+		g_clear_object (&stream);
+
+		fixture_stop (&fixture);
+		return;
+	}
+
+	g_test_trap_subprocess (NULL, 30 * G_USEC_PER_SEC, G_TEST_SUBPROCESS_DEFAULT);
+	g_test_trap_assert_passed ();
+	/* Lowered, kept, lowered at stream creation */
+	g_test_trap_assert_stderr ("*interface MTU (200 bytes) is smaller than the smallest packet size of the device"
+				   " (220 bytes)*interface MTU (200 bytes) is smaller*interface MTU (200 bytes) is"
+				   " smaller*");
+}
+
 /* Issue #1047, before any adjustment: the network drops the data packets, larger than its MTU, and only the small
  * leader and trailer packets of each frame reach the host. The stream counts these failures, and warns once in a
  * while, naming the packet size and the interface MTU. The warnings of the stream category go to stderr. */
@@ -510,6 +562,7 @@ main (int argc, char *argv[])
 	g_test_add_func ("/fakegvmtu/known-mtu", known_mtu_test);
 	g_test_add_func ("/fakegvmtu/issue-1047", issue_1047_test);
 	g_test_add_func ("/fakegvmtu/never-adjust", never_adjust_test);
+	g_test_add_func ("/fakegvmtu/mtu-below-minimum", mtu_below_minimum_test);
 	g_test_add_func ("/fakegvmtu/leader-trailer-only", leader_trailer_only_test);
 	g_test_add_func ("/fakegvmtu/leader-trailer-only-last-packet", leader_trailer_only_last_packet_test);
 	g_test_add_func ("/fakegvmtu/leader-trailer-only-single-frame", leader_trailer_only_single_frame_test);

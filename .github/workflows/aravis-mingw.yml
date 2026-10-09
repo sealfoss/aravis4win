@@ -67,8 +67,8 @@ jobs:
         set -e
         meson install -C ./build --no-rebuild --destdir "$(cygpath -m "$PWD/stage")"
         python .github/scripts/package-windows.py --builddir build --destdir stage \
-          --flavour msys2-${{matrix.sys}} --revision "$GITHUB_SHA" ${{ github.event_name == 'release' && '--release' || '' }} \
-          --output-dir dist
+          --flavour msys2-${{matrix.sys}} --revision "$GITHUB_SHA" --source-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+          ${{ github.event_name == 'release' && '--release' || '' }} --output-dir dist
     - name: smoke test
       if: matrix.package
       run: |

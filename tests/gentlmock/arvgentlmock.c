@@ -120,6 +120,7 @@ typedef enum {
 
 typedef struct {
 	guint n_devices;
+	guint n_interfaces;
 	guint32 missing_infos;
 	guint32 empty_infos;
 	guint fail_from[MOCK_N_FUNCTIONS];
@@ -132,10 +133,12 @@ typedef struct {
 	guint64 close_delay_us;
 	char device_event_id[MOCK_DEVICE_EVENT_ID_LENGTH_MAX + 1];	/* Empty: no remote device event */
 	guint64 size_excess;
+	guint64 image_offset;
 } MockConfig;
 
 static const char *mock_option_names[] = {
 	"ARV_GENTL_MOCK_N_DEVICES",
+	"ARV_GENTL_MOCK_N_INTERFACES",
 	"ARV_GENTL_MOCK_MISSING_INFO",
 	"ARV_GENTL_MOCK_EMPTY_INFO",
 	"ARV_GENTL_MOCK_FAIL",
@@ -146,7 +149,8 @@ static const char *mock_option_names[] = {
 	"ARV_GENTL_MOCK_N_PARTS",
 	"ARV_GENTL_MOCK_CLOSE_DELAY_US",
 	"ARV_GENTL_MOCK_DEVICE_EVENT_ID",
-	"ARV_GENTL_MOCK_SIZE_EXCESS"
+	"ARV_GENTL_MOCK_SIZE_EXCESS",
+	"ARV_GENTL_MOCK_IMAGE_OFFSET"
 };
 
 typedef enum {
@@ -167,8 +171,16 @@ typedef struct {
 	MockDevice *device;
 } MockPort;
 
-struct _MockDevice {
+/* An interface module. Its address is its handle. */
+typedef struct {
 	guint index;
+	char id[32];
+	gboolean is_open;
+} MockInterface;
+
+struct _MockDevice {
+	guint index;			/* In its interface */
+	MockInterface *interface;
 	char *id;
 	char *serial_nbr;
 	char *display_name;
@@ -198,6 +210,7 @@ typedef struct {
 	gboolean is_data_larger;
 	size_t size_filled;
 	size_t data_size;
+	size_t image_offset;
 	guint64 frame_id;
 	guint64 timestamp_ns;
 	guint32 width;
@@ -257,9 +270,10 @@ static guint mock_session_calls[MOCK_N_FUNCTIONS];
 static GHashTable *mock_handles = NULL;
 static int mock_system_tag;
 static gboolean mock_system_is_open = FALSE;
-static int mock_interface_tag;
-static gboolean mock_interface_is_open = FALSE;
-static MockDevice *mock_devices[ARV_GENTL_MOCK_MAX_DEVICES];
+static MockInterface mock_interfaces[ARV_GENTL_MOCK_MAX_INTERFACES];
+static guint mock_n_interfaces = 0;
+/* The devices of all the interfaces, interface by interface */
+static MockDevice *mock_devices[ARV_GENTL_MOCK_MAX_INTERFACES * ARV_GENTL_MOCK_MAX_DEVICES];
 static guint mock_n_devices = 0;
 static GList *mock_events = NULL;
 static GC_ERROR mock_last_error = GC_ERR_SUCCESS;
@@ -289,6 +303,7 @@ mock_config_reset (MockConfig *config)
 	memset (config, 0, sizeof (MockConfig));
 
 	config->n_devices = 1;
+	config->n_interfaces = 1;
 	config->event_kill = MOCK_EVENT_KILL_LATCH;
 	config->buf_announce_min = 1;
 	config->n_parts = -1;
@@ -394,6 +409,11 @@ mock_config_set (MockConfig *config, const char *name, const char *value)
 
 		config->n_devices = (guint) MIN (n_devices, ARV_GENTL_MOCK_MAX_DEVICES);
 		return TRUE;
+	} else if (g_strcmp0 (name, "ARV_GENTL_MOCK_N_INTERFACES") == 0) {
+		guint64 n_interfaces = value != NULL ? g_ascii_strtoull (value, NULL, 10) : 1;
+
+		config->n_interfaces = (guint) CLAMP (n_interfaces, 1, ARV_GENTL_MOCK_MAX_INTERFACES);
+		return TRUE;
 	} else if (g_strcmp0 (name, "ARV_GENTL_MOCK_MISSING_INFO") == 0) {
 		return mock_parse_infos (value, &config->missing_infos);
 	} else if (g_strcmp0 (name, "ARV_GENTL_MOCK_EMPTY_INFO") == 0) {
@@ -444,6 +464,13 @@ mock_config_set (MockConfig *config, const char *name, const char *value)
 		return TRUE;
 	} else if (g_strcmp0 (name, "ARV_GENTL_MOCK_SIZE_EXCESS") == 0) {
 		config->size_excess = value != NULL ? g_ascii_strtoull (value, NULL, 10) : 0;
+		return TRUE;
+	} else if (g_strcmp0 (name, "ARV_GENTL_MOCK_IMAGE_OFFSET") == 0) {
+		guint64 image_offset = value != NULL ? g_ascii_strtoull (value, NULL, 10) : 0;
+
+		if (image_offset > ARV_GENTL_MOCK_IMAGE_OFFSET_MAX)
+			return FALSE;
+		config->image_offset = image_offset;
 		return TRUE;
 	}
 
@@ -710,11 +737,12 @@ mock_tl_info (TL_INFO_CMD info_cmd, INFO_DATATYPE *piType, void *pBuffer, size_t
 }
 
 static GC_ERROR
-mock_interface_info (INTERFACE_INFO_CMD info_cmd, INFO_DATATYPE *piType, void *pBuffer, size_t *piSize)
+mock_interface_info (MockInterface *interface, INTERFACE_INFO_CMD info_cmd, INFO_DATATYPE *piType, void *pBuffer,
+		     size_t *piSize)
 {
 	switch (info_cmd) {
 		case INTERFACE_INFO_ID:
-			return mock_info_text (MOCK_INTERFACE_INFO_ID, ARV_GENTL_MOCK_INTERFACE_ID,
+			return mock_info_text (MOCK_INTERFACE_INFO_ID, interface->id,
 					       piType, pBuffer, piSize);
 		case INTERFACE_INFO_DISPLAYNAME:
 			return mock_info_text (MOCK_INTERFACE_INFO_DISPLAYNAME, "Mock interface",
@@ -769,16 +797,55 @@ mock_device_info (MockDevice *device, DEVICE_INFO_CMD info_cmd, INFO_DATATYPE *p
 	}
 }
 
+static MockInterface *
+mock_find_interface (const char *id)
+{
+	guint i;
+
+	for (i = 0; i < mock_n_interfaces; i++)
+		if (g_strcmp0 (mock_interfaces[i].id, id) == 0)
+			return &mock_interfaces[i];
+
+	return NULL;
+}
+
+/* Devices are found by their id in their interface: the interfaces have the same device ids */
+
 static MockDevice *
-mock_find_device (const char *id)
+mock_find_device (MockInterface *interface, const char *id)
 {
 	guint i;
 
 	for (i = 0; i < mock_n_devices; i++)
-		if (g_strcmp0 (mock_devices[i]->id, id) == 0)
+		if (mock_devices[i]->interface == interface && g_strcmp0 (mock_devices[i]->id, id) == 0)
 			return mock_devices[i];
 
 	return NULL;
+}
+
+static MockDevice *
+mock_get_interface_device (MockInterface *interface, guint index)
+{
+	guint i;
+
+	for (i = 0; i < mock_n_devices; i++)
+		if (mock_devices[i]->interface == interface && mock_devices[i]->index == index)
+			return mock_devices[i];
+
+	return NULL;
+}
+
+static guint
+mock_get_interface_n_devices (MockInterface *interface)
+{
+	guint n_devices = 0;
+	guint i;
+
+	for (i = 0; i < mock_n_devices; i++)
+		if (mock_devices[i]->interface == interface)
+			n_devices++;
+
+	return n_devices;
 }
 
 /* Object lifecycle. Closing a module before its children is a violation, the children are then closed. */
@@ -860,28 +927,32 @@ mock_device_close (MockDevice *device)
 }
 
 static void
-mock_interface_close (void)
+mock_interface_close (MockInterface *interface)
 {
 	guint i;
 
 	for (i = 0; i < mock_n_devices; i++) {
-		if (mock_devices[i]->is_open) {
+		if (mock_devices[i]->interface == interface && mock_devices[i]->is_open) {
 			mock_violation ("Interface closed with the open device %s", mock_devices[i]->id);
 			mock_device_close (mock_devices[i]);
 		}
 	}
 
-	mock_detach_events (&mock_interface_tag, "Interface");
-	mock_handle_remove (&mock_interface_tag);
-	mock_interface_is_open = FALSE;
+	mock_detach_events (interface, "Interface");
+	mock_handle_remove (interface);
+	interface->is_open = FALSE;
 }
 
 static void
 mock_system_close (void)
 {
-	if (mock_interface_is_open) {
-		mock_violation ("System closed with an open interface");
-		mock_interface_close ();
+	guint i;
+
+	for (i = 0; i < mock_n_interfaces; i++) {
+		if (mock_interfaces[i].is_open) {
+			mock_violation ("System closed with an open interface");
+			mock_interface_close (&mock_interfaces[i]);
+		}
 	}
 
 	mock_detach_events (&mock_system_tag, "System");
@@ -896,14 +967,33 @@ mock_init (void)
 
 	mock_handles = g_hash_table_new (g_direct_hash, g_direct_equal);
 
-	mock_n_devices = mock_config.n_devices;
+	mock_n_interfaces = mock_config.n_interfaces;
+	for (i = 0; i < mock_n_interfaces; i++) {
+		mock_interfaces[i].index = i;
+		g_snprintf (mock_interfaces[i].id, sizeof (mock_interfaces[i].id),
+			    ARV_GENTL_MOCK_INTERFACE_ID_PREFIX "%u", i);
+		mock_interfaces[i].is_open = FALSE;
+	}
+
+	/* The same device ids on each interface. The fake cameras of the interfaces other than the first one have
+	 * other serial numbers, which tell them apart. */
+	mock_n_devices = mock_n_interfaces * mock_config.n_devices;
 	for (i = 0; i < mock_n_devices; i++) {
 		MockDevice *device = g_new0 (MockDevice, 1);
+		guint interface_index = i / mock_config.n_devices;
+		guint index = i % mock_config.n_devices;
 
-		device->index = i;
-		device->id = g_strdup_printf (ARV_GENTL_MOCK_GENTL_DEVICE_ID "%u", i);
-		device->serial_nbr = g_strdup_printf (ARV_GENTL_MOCK_SERIAL "%u", i);
-		device->display_name = g_strdup_printf ("Mock camera %u", i);
+		device->index = index;
+		device->interface = &mock_interfaces[interface_index];
+		device->id = g_strdup_printf (ARV_GENTL_MOCK_GENTL_DEVICE_ID "%u", index);
+		if (interface_index == 0) {
+			device->serial_nbr = g_strdup_printf (ARV_GENTL_MOCK_SERIAL "%u", index);
+			device->display_name = g_strdup_printf ("Mock camera %u", index);
+		} else {
+			device->serial_nbr = g_strdup_printf (ARV_GENTL_MOCK_SERIAL "%u-IF%u", index, interface_index);
+			device->display_name = g_strdup_printf ("Mock camera %u of interface %u", index,
+								interface_index);
+		}
 		device->port.device = device;
 
 		mock_devices[i] = device;
@@ -933,6 +1023,7 @@ mock_close_lib (void)
 		mock_devices[i] = NULL;
 	}
 	mock_n_devices = 0;
+	mock_n_interfaces = 0;
 
 	/* An event still waited for is freed by the last waiting thread */
 	for (iter = mock_events; iter != NULL; iter = iter->next) {
@@ -1002,15 +1093,19 @@ mock_buffer_fill (MockStream *stream, MockBuffer *buffer)
 	ArvFakeCamera *camera = stream->device->camera;
 	guint32 value;
 	size_t payload;
+	size_t image_offset;
 
 	payload = arv_fake_camera_get_payload (camera);
+	/* Data before the image, like chunk data, counted by the data size */
+	image_offset = (size_t) mock_config.image_offset;
 
 	stream->frame_counter++;
 
 	buffer->has_new_data = TRUE;
 	buffer->frame_id = stream->frame_counter;
 	buffer->timestamp_ns = g_get_real_time () * 1000;
-	buffer->data_size = payload;
+	buffer->image_offset = image_offset;
+	buffer->data_size = image_offset + payload;
 	buffer->is_incomplete = FALSE;
 	buffer->is_data_larger = FALSE;
 
@@ -1030,20 +1125,21 @@ mock_buffer_fill (MockStream *stream, MockBuffer *buffer)
 	arv_fake_camera_read_register (camera, ARV_FAKE_CAMERA_REGISTER_PIXEL_FORMAT, &value);
 	buffer->pixel_format = value;
 
-	if (payload > buffer->size) {
+	if (image_offset + payload > buffer->size) {
 		buffer->is_incomplete = TRUE;
 		buffer->is_data_larger = TRUE;
 		buffer->size_filled = 0;
 	} else {
 		ArvBuffer *arv_buffer;
 
-		/* The fake camera fills the buffer memory, wrapped in an ArvBuffer. The stream, its device and the
-		 * buffer stay valid without the mutex: the buffer is in no queue, and can't be revoked, and the stream
-		 * can't be flushed or freed during the fill. */
-		arv_buffer = arv_buffer_new (buffer->size, buffer->data);
+		/* The fake camera fills the buffer memory after the image offset, wrapped in an ArvBuffer. The stream,
+		 * its device and the buffer stay valid without the mutex: the buffer is in no queue, and can't be
+		 * revoked, and the stream can't be flushed or freed during the fill. */
+		arv_buffer = arv_buffer_new (buffer->size - image_offset, (guint8 *) buffer->data + image_offset);
 		stream->is_filling = TRUE;
 		g_mutex_unlock (&mock_mutex);
 
+		memset (buffer->data, ARV_GENTL_MOCK_IMAGE_OFFSET_FILL, image_offset);
 		arv_fake_camera_fill_buffer (camera, arv_buffer, NULL);
 
 		g_mutex_lock (&mock_mutex);
@@ -1051,12 +1147,12 @@ mock_buffer_fill (MockStream *stream, MockBuffer *buffer)
 		g_cond_broadcast (&mock_fill_cond);
 		g_object_unref (arv_buffer);
 
-		buffer->size_filled = payload;
+		buffer->size_filled = image_offset + payload;
 
 		if (mock_config.incomplete_every > 0 &&
 		    stream->frame_counter % mock_config.incomplete_every == 0) {
 			buffer->is_incomplete = TRUE;
-			buffer->size_filled = payload / 2;
+			buffer->size_filled = image_offset + payload / 2;
 		}
 
 		/* Sizes larger than the buffer, without the flag of the data larger than the buffer */
@@ -1205,8 +1301,9 @@ mock_buffer_info (MockBuffer *buffer, BUFFER_INFO_CMD info_cmd, INFO_DATATYPE *p
 			return mock_output_sizet (buffer->y_offset, piType, pBuffer, piSize);
 		case BUFFER_INFO_XPADDING:
 		case BUFFER_INFO_YPADDING:
-		case BUFFER_INFO_IMAGEOFFSET:
 			return mock_output_sizet (0, piType, pBuffer, piSize);
+		case BUFFER_INFO_IMAGEOFFSET:
+			return mock_output_sizet (buffer->image_offset, piType, pBuffer, piSize);
 		case BUFFER_INFO_FRAMEID:
 			return mock_output_uint64 (buffer->frame_id, piType, pBuffer, piSize);
 		case BUFFER_INFO_IMAGEPRESENT:
@@ -1689,23 +1786,26 @@ TLGetInterfaceID (TL_HANDLE hSystem, uint32_t iIndex, char *sIfaceID, size_t *pi
 	MOCK_ENTER (TLGetInterfaceID);
 	MOCK_CHECK (hSystem, MOCK_HANDLE_SYSTEM);
 
-	if (iIndex != 0)
+	if (iIndex >= mock_n_interfaces)
 		MOCK_RETURN (GC_ERR_INVALID_INDEX);
 
-	MOCK_RETURN (mock_output_string (ARV_GENTL_MOCK_INTERFACE_ID, NULL, sIfaceID, piSize));
+	MOCK_RETURN (mock_output_string (mock_interfaces[iIndex].id, NULL, sIfaceID, piSize));
 }
 
 GC_ERROR
 TLGetInterfaceInfo (TL_HANDLE hSystem, const char *sIfaceID, INTERFACE_INFO_CMD iInfoCmd,
 		    INFO_DATATYPE *piType, void *pBuffer, size_t *piSize)
 {
+	MockInterface *interface;
+
 	MOCK_ENTER (TLGetInterfaceInfo);
 	MOCK_CHECK (hSystem, MOCK_HANDLE_SYSTEM);
 
-	if (g_strcmp0 (sIfaceID, ARV_GENTL_MOCK_INTERFACE_ID) != 0)
+	interface = mock_find_interface (sIfaceID);
+	if (interface == NULL)
 		MOCK_RETURN (GC_ERR_INVALID_ID);
 
-	MOCK_RETURN (mock_interface_info (iInfoCmd, piType, pBuffer, piSize));
+	MOCK_RETURN (mock_interface_info (interface, iInfoCmd, piType, pBuffer, piSize));
 }
 
 GC_ERROR
@@ -1715,7 +1815,7 @@ TLGetNumInterfaces (TL_HANDLE hSystem, uint32_t *piNumIfaces)
 	MOCK_CHECK (hSystem, MOCK_HANDLE_SYSTEM);
 	MOCK_CHECK_PARAMETER (piNumIfaces != NULL);
 
-	*piNumIfaces = 1;
+	*piNumIfaces = mock_n_interfaces;
 
 	MOCK_RETURN (GC_ERR_SUCCESS);
 }
@@ -1723,19 +1823,22 @@ TLGetNumInterfaces (TL_HANDLE hSystem, uint32_t *piNumIfaces)
 GC_ERROR
 TLOpenInterface (TL_HANDLE hSystem, const char *sIfaceID, IF_HANDLE *phIface)
 {
+	MockInterface *interface;
+
 	MOCK_ENTER (TLOpenInterface);
 	MOCK_CHECK (hSystem, MOCK_HANDLE_SYSTEM);
 	MOCK_CHECK_PARAMETER (phIface != NULL);
 
-	if (g_strcmp0 (sIfaceID, ARV_GENTL_MOCK_INTERFACE_ID) != 0)
+	interface = mock_find_interface (sIfaceID);
+	if (interface == NULL)
 		MOCK_RETURN (GC_ERR_INVALID_ID);
 
-	if (mock_interface_is_open)
+	if (interface->is_open)
 		MOCK_RETURN (GC_ERR_RESOURCE_IN_USE);
 
-	mock_interface_is_open = TRUE;
-	mock_handle_add (&mock_interface_tag, MOCK_HANDLE_INTERFACE);
-	*phIface = &mock_interface_tag;
+	interface->is_open = TRUE;
+	mock_handle_add (interface, MOCK_HANDLE_INTERFACE);
+	*phIface = interface;
 
 	MOCK_RETURN (GC_ERR_SUCCESS);
 }
@@ -1761,7 +1864,7 @@ IFClose (IF_HANDLE hIface)
 	mock_close_delay ();
 	MOCK_CHECK (hIface, MOCK_HANDLE_INTERFACE);
 
-	mock_interface_close ();
+	mock_interface_close (hIface);
 
 	MOCK_RETURN (GC_ERR_SUCCESS);
 }
@@ -1773,7 +1876,7 @@ IFGetInfo (IF_HANDLE hIface, INTERFACE_INFO_CMD iInfoCmd, INFO_DATATYPE *piType,
 {
 	MOCK_ENTER (IFGetInfo);
 	MOCK_CHECK (hIface, MOCK_HANDLE_INTERFACE);
-	MOCK_RETURN (mock_interface_info (iInfoCmd, piType, pBuffer, piSize));
+	MOCK_RETURN (mock_interface_info (hIface, iInfoCmd, piType, pBuffer, piSize));
 }
 
 #endif
@@ -1781,13 +1884,16 @@ IFGetInfo (IF_HANDLE hIface, INTERFACE_INFO_CMD iInfoCmd, INFO_DATATYPE *piType,
 GC_ERROR
 IFGetDeviceID (IF_HANDLE hIface, uint32_t iIndex, char *sDeviceID, size_t *piSize)
 {
+	MockDevice *device;
+
 	MOCK_ENTER (IFGetDeviceID);
 	MOCK_CHECK (hIface, MOCK_HANDLE_INTERFACE);
 
-	if (iIndex >= mock_n_devices)
+	device = mock_get_interface_device (hIface, iIndex);
+	if (device == NULL)
 		MOCK_RETURN (GC_ERR_INVALID_INDEX);
 
-	MOCK_RETURN (mock_output_string (mock_devices[iIndex]->id, NULL, sDeviceID, piSize));
+	MOCK_RETURN (mock_output_string (device->id, NULL, sDeviceID, piSize));
 }
 
 GC_ERROR
@@ -1799,7 +1905,7 @@ IFGetDeviceInfo (IF_HANDLE hIface, const char *sDeviceID, DEVICE_INFO_CMD iInfoC
 	MOCK_ENTER (IFGetDeviceInfo);
 	MOCK_CHECK (hIface, MOCK_HANDLE_INTERFACE);
 
-	device = mock_find_device (sDeviceID);
+	device = mock_find_device (hIface, sDeviceID);
 	if (device == NULL)
 		MOCK_RETURN (GC_ERR_INVALID_ID);
 
@@ -1813,7 +1919,7 @@ IFGetNumDevices (IF_HANDLE hIface, uint32_t *piNumDevices)
 	MOCK_CHECK (hIface, MOCK_HANDLE_INTERFACE);
 	MOCK_CHECK_PARAMETER (piNumDevices != NULL);
 
-	*piNumDevices = mock_n_devices;
+	*piNumDevices = mock_get_interface_n_devices (hIface);
 
 	MOCK_RETURN (GC_ERR_SUCCESS);
 }
@@ -1827,7 +1933,7 @@ IFOpenDevice (IF_HANDLE hIface, const char *sDeviceID, DEVICE_ACCESS_FLAGS iOpen
 	MOCK_CHECK (hIface, MOCK_HANDLE_INTERFACE);
 	MOCK_CHECK_PARAMETER (phDevice != NULL);
 
-	device = mock_find_device (sDeviceID);
+	device = mock_find_device (hIface, sDeviceID);
 	if (device == NULL)
 		MOCK_RETURN (GC_ERR_INVALID_ID);
 
@@ -1969,7 +2075,7 @@ DevGetParentIF (DEV_HANDLE hDevice, IF_HANDLE *phIface)
 	MOCK_CHECK (hDevice, MOCK_HANDLE_DEVICE);
 	MOCK_CHECK_PARAMETER (phIface != NULL);
 
-	*phIface = &mock_interface_tag;
+	*phIface = ((MockDevice *) hDevice)->interface;
 
 	MOCK_RETURN (GC_ERR_SUCCESS);
 }
@@ -2189,11 +2295,14 @@ mock_buffer_part_info (MockBuffer *buffer, uint32_t part_index, BUFFER_PART_INFO
 	if (mock_config.n_parts < 1 || part_index >= (uint32_t) mock_config.n_parts)
 		return GC_ERR_INVALID_INDEX;
 
+	/* The image part, without the data before the image */
 	switch (info_cmd) {
 		case BUFFER_PART_INFO_BASE:
-			return mock_output_ptr (buffer->data, piType, pBuffer, piSize);
+			return mock_output_ptr ((guint8 *) buffer->data + buffer->image_offset, piType, pBuffer, piSize);
 		case BUFFER_PART_INFO_DATA_SIZE:
-			return mock_output_sizet (buffer->size_filled, piType, pBuffer, piSize);
+			return mock_output_sizet (buffer->size_filled > buffer->image_offset ?
+						  buffer->size_filled - buffer->image_offset : 0,
+						  piType, pBuffer, piSize);
 		case BUFFER_PART_INFO_DATA_TYPE:
 			/* 2D image */
 			return mock_output_sizet (1, piType, pBuffer, piSize);
@@ -2739,8 +2848,11 @@ mock_get_counter (const char *name)
 		return mock_is_initialized ? 1 : 0;
 	if (g_strcmp0 (name, "open-tl") == 0)
 		return mock_system_is_open ? 1 : 0;
-	if (g_strcmp0 (name, "open-interfaces") == 0)
-		return mock_interface_is_open ? 1 : 0;
+	if (g_strcmp0 (name, "open-interfaces") == 0) {
+		for (i = 0; i < mock_n_interfaces; i++)
+			value += mock_interfaces[i].is_open ? 1 : 0;
+		return value;
+	}
 
 	if (g_strcmp0 (name, "open-devices") == 0) {
 		for (i = 0; i < mock_n_devices; i++)
@@ -2798,8 +2910,9 @@ arv_gentl_mock_set_option (const char *name, const char *value)
 
 	g_mutex_lock (&mock_mutex);
 
-	/* The number of devices is fixed by GCInitLib */
-	if (mock_is_initialized && g_strcmp0 (name, "ARV_GENTL_MOCK_N_DEVICES") != 0)
+	/* The number of devices and interfaces is fixed by GCInitLib */
+	if (mock_is_initialized && g_strcmp0 (name, "ARV_GENTL_MOCK_N_DEVICES") != 0 &&
+	    g_strcmp0 (name, "ARV_GENTL_MOCK_N_INTERFACES") != 0)
 		success = mock_config_set (&mock_config, name, value);
 
 	g_mutex_unlock (&mock_mutex);

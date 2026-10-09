@@ -182,6 +182,47 @@ mtu_alignment_test (void)
 	g_assert_cmpuint (search (8228, 200, TRUE, NULL), ==, MIN_SIZE);
 }
 
+/* An MTU below the smallest packet size: no packet size fits in it. Every search gives the smallest packet size, which
+ * is larger than the MTU, and a warning of the device debug category says so, instead of an info message claiming
+ * that the packet size fits. The debug output goes to stderr, which GLib only matches for a subprocess. */
+
+static void
+mtu_below_minimum_test (void)
+{
+	if (g_test_subprocess ()) {
+		TestPacketData pass = {0};
+		TestPacketData fail = {0};
+
+		g_assert_true (arv_debug_enable ("device:2"));
+
+		fail.fail_all = TRUE;
+
+		/* An MTU fitting packet sizes: no warning */
+		g_assert_cmpuint (search (8228, 1500, TRUE, NULL), ==, 1500);
+
+		/* A larger packet size is lowered to the smallest one, with or without test packets */
+		g_assert_cmpuint (search (8228, 200, TRUE, NULL), ==, MIN_SIZE);
+		g_assert_cmpuint (search (8228, 200, TRUE, &pass), ==, MIN_SIZE);
+		g_assert_cmpuint (search (8228, 200, FALSE, &pass), ==, MIN_SIZE);
+		g_assert_cmpuint (search (8228, 200, TRUE, &fail), ==, MIN_SIZE);
+		g_assert_cmpuint (search (8228, 200, FALSE, &fail), ==, MIN_SIZE);
+
+		/* The smallest packet size is kept, and doesn't fit either */
+		g_assert_cmpuint (search (MIN_SIZE, MIN_SIZE - 1, TRUE, NULL), ==, MIN_SIZE);
+		return;
+	}
+
+	g_test_trap_subprocess (NULL, 0, G_TEST_SUBPROCESS_DEFAULT);
+	g_test_trap_assert_passed ();
+	g_test_trap_assert_stderr ("*Packet size lowered from 8228 to 1500 bytes, to fit in the interface MTU (1500 bytes)*");
+	g_test_trap_assert_stderr ("*interface MTU (200 bytes) is smaller than the smallest packet size of the device"
+				   " (220 bytes)*");
+	g_test_trap_assert_stderr ("*interface MTU (219 bytes) is smaller than the smallest packet size of the device"
+				   " (220 bytes)*");
+	g_test_trap_assert_stderr_unmatched ("*to fit in the interface MTU (200 bytes)*");
+	g_test_trap_assert_stderr_unmatched ("*MTU (1500 bytes) is smaller*");
+}
+
 static void
 search_error_test (void)
 {
@@ -364,6 +405,7 @@ main (int argc, char *argv[])
 	g_test_add_func ("/gvpacketsize/mtu-dropped", mtu_dropped_test);
 	g_test_add_func ("/gvpacketsize/mtu-unknown", mtu_unknown_test);
 	g_test_add_func ("/gvpacketsize/mtu-alignment", mtu_alignment_test);
+	g_test_add_func ("/gvpacketsize/mtu-below-minimum", mtu_below_minimum_test);
 	g_test_add_func ("/gvpacketsize/search-error", search_error_test);
 	g_test_add_func ("/gvpacketsize/interface-mtu", interface_mtu_test);
 	g_test_add_func ("/gvpacketsize/loopback-mtu-override", loopback_mtu_override_test);

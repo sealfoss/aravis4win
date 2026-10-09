@@ -3373,8 +3373,12 @@ static const char *test_gentl_variables[] = {
 	"GENICAM_GENTL32_PATH",
 	"ARV_GENTL_PRODUCERS",
 	"ARV_GENTL_MOCK_FRAME_PERIOD_US",
-	"ARV_GENTL_MOCK_N_DEVICES"
+	"ARV_GENTL_MOCK_N_DEVICES",
+	"ARV_GENTL_MOCK_IMAGE_OFFSET"
 };
+
+/* A GenICam description written by a test for the camera of the mock producer, removed by teardown_gentl () */
+static char *test_gentl_genicam_path = NULL;
 
 static void
 setup_gentl (void)
@@ -3404,6 +3408,12 @@ teardown_gentl (void)
 
 	for (i = 0; i < G_N_ELEMENTS (test_gentl_variables); i++)
 		g_unsetenv (test_gentl_variables[i]);
+	/* The description a test may have changed */
+	arv_set_fake_camera_genicam_filename (GENICAM_FILENAME);
+	if (test_gentl_genicam_path != NULL) {
+		g_remove (test_gentl_genicam_path);
+		g_clear_pointer (&test_gentl_genicam_path, g_free);
+	}
 
 	test_aravis_log_check ();
 }
@@ -3575,6 +3585,73 @@ GST_START_TEST (test_gentl_restart_followed_objects)
 }
 GST_END_TEST;
 
+/* A producer telling an image offset, the data before the image being for example chunk data, which the payload size
+ * of the camera counts: the frames filling their buffer came back as SIZE_MISMATCH failures, and aravissrc dropped
+ * them all. Each frame must also be the image alone, without the bytes before it. */
+
+#define TEST_GENTL_IMAGE_OFFSET		64
+#define TEST_PAYLOAD_SIZE_FORMULA	"WIDTH * HEIGHT * ((PIXELFORMAT>>16)&amp;0xFF) / 8"
+
+/* Writes the GenICam description of the fake camera with a payload size larger by @excess bytes. Returns the path of
+ * the file. */
+
+static char *
+test_write_genicam_file_with_payload_excess (guint excess)
+{
+	const char *formula;
+	char *xml = NULL;
+	char *contents;
+	char *path = NULL;
+	GError *error = NULL;
+	gsize size = 0;
+	int fd;
+
+	fail_unless (g_file_get_contents (GENICAM_FILENAME, &xml, &size, &error), "Can't read %s", GENICAM_FILENAME);
+	formula = g_strstr_len (xml, size, TEST_PAYLOAD_SIZE_FORMULA);
+	fail_unless (formula != NULL);
+	contents = g_strdup_printf ("%.*s" TEST_PAYLOAD_SIZE_FORMULA " + %u%s", (int) (formula - xml), xml, excess,
+				    formula + strlen (TEST_PAYLOAD_SIZE_FORMULA));
+	g_free (xml);
+
+	fd = g_file_open_tmp ("arv-gst-test-XXXXXX.xml", &path, &error);
+	fail_unless (fd >= 0);
+	g_close (fd, NULL);
+	fail_unless (g_file_set_contents (path, contents, -1, &error));
+	g_free (contents);
+
+	return path;
+}
+
+GST_START_TEST (test_gentl_image_offset)
+{
+	GstElement *pipeline;
+	GstSample *sample;
+	guint i;
+
+	TEST_GENTL_SKIP_WITHOUT_MOCK ();
+
+	test_gentl_genicam_path = test_write_genicam_file_with_payload_excess (TEST_GENTL_IMAGE_OFFSET);
+	/* For the fake camera of the mock producer, created when the element opens it */
+	arv_set_fake_camera_genicam_filename (test_gentl_genicam_path);
+	g_setenv ("ARV_GENTL_MOCK_IMAGE_OFFSET", G_STRINGIFY (TEST_GENTL_IMAGE_OFFSET), TRUE);
+
+	pipeline = test_pipeline_new ("aravissrc name=src interface=GenTL ! %s ! %s", TEST_CAPS, TEST_SINK);
+	gst_sample_unref (test_pipeline_play (pipeline));
+	for (i = 0; i < 5; i++) {
+		TestFrame *frame;
+
+		sample = test_pipeline_pull_sample (pipeline, TEST_TIMEOUT);
+		fail_unless (sample != NULL, "No sample: %s", test_pipeline_dup_error_text (pipeline));
+		frame = test_frame_new_from_sample (sample);
+		test_frame_check (frame);
+		test_frame_free (frame);
+		gst_sample_unref (sample);
+	}
+
+	test_pipeline_free (pipeline);
+}
+GST_END_TEST;
+
 GST_START_TEST (test_gentl_error_camera_names)
 {
 	GstElement *pipeline;
@@ -3727,6 +3804,7 @@ gst_aravis_suite (void)
 	tcase_add_test (tcase, test_gentl_restart_followed_objects);
 	tcase_add_test (tcase, test_gentl_error_camera_names);
 	tcase_add_test (tcase, test_gentl_device_provider);
+	tcase_add_test (tcase, test_gentl_image_offset);
 	suite_add_tcase (suite, tcase);
 
 	/* With the fake GigEVision camera on 127.0.0.1: only in the test of the 'network' suite */

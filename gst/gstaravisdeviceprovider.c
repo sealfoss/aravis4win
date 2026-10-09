@@ -275,13 +275,36 @@ gst_aravis_device_provider_new_device (const GstAravisDeviceInfos *infos)
 	return GST_DEVICE (device);
 }
 
-/* Each identifier is listed once: the element opens a single camera by its identifier, while one state of the device
- * list may give an identifier twice, for two cameras with the same vendor, model and serial number for example */
+/* The devices listed, by the interface and identifier with which their element selects their camera */
+
+static guint
+gst_aravis_device_provider_hash_device (gconstpointer key)
+{
+	const GstAravisDevice *device = key;
+
+	return g_str_hash (device->device_id) ^ (device->interface_id != NULL ? g_str_hash (device->interface_id) : 0);
+}
+
+static gboolean
+gst_aravis_device_provider_equal_devices (gconstpointer a, gconstpointer b)
+{
+	const GstAravisDevice *device_a = a;
+	const GstAravisDevice *device_b = b;
+
+	return g_strcmp0 (device_a->device_id, device_b->device_id) == 0 &&
+		g_strcmp0 (device_a->interface_id, device_b->interface_id) == 0;
+}
+
+/* Each identifier is listed once per interface: the element opens a single camera by its identifier on the interface
+ * of the device, while one state of the device list may give an identifier twice on an interface, for two cameras with
+ * the same vendor, model and serial number for example. The same identifier on two interfaces, for a USB3Vision and a
+ * GigEVision camera with the same vendor, model and serial number for example, gives two devices: the element of each
+ * opens the camera of its own interface. */
 
 static GList *
 gst_aravis_device_provider_probe (GstDeviceProvider *provider)
 {
-	GHashTable *device_ids;
+	GHashTable *listed_devices;
 	GList *devices = NULL;
 	GArray *list;
 	unsigned int i;
@@ -298,7 +321,8 @@ gst_aravis_device_provider_probe (GstDeviceProvider *provider)
 	arv_update_device_list ();
 
 	list = gst_aravis_device_provider_read_list ();
-	device_ids = g_hash_table_new (g_str_hash, g_str_equal);
+	listed_devices = g_hash_table_new (gst_aravis_device_provider_hash_device,
+					   gst_aravis_device_provider_equal_devices);
 
 	for (i = 0; i < list->len; i++) {
 		const GstAravisDeviceInfos *infos = &g_array_index (list, GstAravisDeviceInfos, i);
@@ -307,21 +331,23 @@ gst_aravis_device_provider_probe (GstDeviceProvider *provider)
 		if (device == NULL)
 			continue;
 
-		/* The table holds the identifiers of the devices listed, which outlive it. Not g_hash_table_add ()
-		 * alone: for an identifier already in the table, it would keep the identifier of the duplicate instead,
-		 * freed below, which the next look-up of that identifier would read. */
-		if (g_hash_table_contains (device_ids, GST_ARAVIS_DEVICE (device)->device_id)) {
-			GST_INFO_OBJECT (provider, "Device '%s' found twice, listed once",
-					 GST_ARAVIS_DEVICE (device)->device_id);
+		/* The table holds the devices listed, which outlive it. Not g_hash_table_add () alone: for a device
+		 * already in the table, it would keep the duplicate instead, freed below, which the next look-up of that
+		 * identifier on that interface would read. */
+		if (g_hash_table_contains (listed_devices, device)) {
+			GST_INFO_OBJECT (provider, "Device '%s' found twice on interface %s, listed once",
+					 GST_ARAVIS_DEVICE (device)->device_id,
+					 GST_ARAVIS_DEVICE (device)->interface_id != NULL ?
+					 GST_ARAVIS_DEVICE (device)->interface_id : "(unknown)");
 			gst_object_unref (gst_object_ref_sink (device));
 			continue;
 		}
 
-		g_hash_table_add (device_ids, GST_ARAVIS_DEVICE (device)->device_id);
+		g_hash_table_add (listed_devices, device);
 		devices = g_list_prepend (devices, device);
 	}
 
-	g_hash_table_unref (device_ids);
+	g_hash_table_unref (listed_devices);
 	g_array_unref (list);
 
 	GST_INFO_OBJECT (provider, "Found %u camera%s in %" G_GINT64_FORMAT " ms", g_list_length (devices),

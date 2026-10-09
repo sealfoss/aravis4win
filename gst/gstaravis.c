@@ -1283,6 +1283,8 @@ gst_aravis_create (GstPushSrc * push_src, GstBuffer ** buffer)
 	int width, height;
 	char *buffer_data;
 	size_t buffer_size;
+	const void *image_data;
+	size_t image_size;
 	guint64 timestamp_ns;
 	gboolean base_src_does_timestamp;
 	gboolean add_reference_timestamp_meta;
@@ -1320,6 +1322,13 @@ gst_aravis_create (GstPushSrc * push_src, GstBuffer ** buffer)
 	}
 
 	buffer_data = (char *) arv_buffer_get_data (arv_buffer, &buffer_size);
+	/* Some GenTL producers put chunk data or a gap before the image (BUFFER_INFO_IMAGEOFFSET): send the image only.
+	 * Elsewhere the image starts the buffer, and the bytes sent are unchanged. */
+	image_data = arv_buffer_get_image_data (arv_buffer, &image_size);
+	if (image_data != NULL && (const char *) image_data != buffer_data) {
+		buffer_data = (char *) image_data;
+		buffer_size = image_size;
+	}
 	/* Lent or copied, never more than the buffer holds */
 	buffer_size = MIN (buffer_size, stream_state->buffer_size);
 	arv_buffer_get_image_region (arv_buffer, NULL, NULL, &width, &height);

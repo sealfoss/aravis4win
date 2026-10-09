@@ -7,7 +7,8 @@
  * The cases run aravissrc over USB3Vision without a camera: both USB modes, the USB settings whatever their order
  * relative to camera-name, frames lent downstream across a stop and a renegotiation, a renegotiation while the
  * application holds the previous stream, a camera unplugged while streaming, and the device provider while the device
- * list changes, while a camera streams, or when the list gives an identifier several times. */
+ * list changes, while a camera streams, or when the list gives an identifier several times, on one interface or, with
+ * a fake GigEVision camera in the 'network' suite only, on two. */
 
 #include "fakeuvtest.h"
 #include <gst/gst.h>
@@ -1173,6 +1174,131 @@ provider_duplicate_ids_test (void)
 	gst_object_unref (provider);
 }
 
+/* A device identifier is only unique on its interface: a USB3Vision camera and a GigEVision camera with the same vendor,
+ * model and serial number have the same one, here a fake camera of each with the serial number "1",
+ * 'Aravis-Fake-1'. The element opens the camera of a device through the interface of the device only, so both are
+ * listed, each with its interface, and the element of each opens that camera. The fake GigEVision camera, on
+ * 127.0.0.1, binds the fixed GigEVision ports: this case only runs in the test of the 'network' suite, with
+ * FAKEUVGST_TEST_NETWORK=1, never two at once. */
+
+#define SAME_ID_SERIAL		"1"
+#define SAME_ID_GV_ADDRESS	"127.0.0.1"
+
+static void
+provider_same_id_two_interfaces_test (void)
+{
+	static const char *interface_ids[] = {"USB3Vision", "GigEVision"};
+	gboolean listed[G_N_ELEMENTS (interface_ids)] = {FALSE, FALSE};
+	ArvGvFakeCamera *gv_camera;
+	FakeUsbDevice *usb_camera;
+	GstDeviceProvider *provider;
+	GList *devices;
+	GList *iter;
+	char *device_id;
+	guint n_ids = 0;
+	guint i;
+
+	usb_camera = fakeuv_add_camera (SAME_ID_SERIAL);
+	device_id = fake_usb_camera_dup_device_id (usb_camera);
+	g_assert_cmpstr (device_id, ==, "Aravis-Fake-" SAME_ID_SERIAL);
+
+	gv_camera = arv_gv_fake_camera_new (SAME_ID_GV_ADDRESS, SAME_ID_SERIAL);
+	g_assert_true (ARV_IS_GV_FAKE_CAMERA (gv_camera));
+	arv_enable_interface ("GigEVision");
+
+	/* The device list gives the identifier once on each interface */
+	arv_update_device_list ();
+	for (i = 0; i < arv_get_n_devices (); i++) {
+		g_test_message ("Device list %u: '%s' on %s", i, arv_get_device_id (i), arv_get_device_interface_id (i));
+		if (g_strcmp0 (arv_get_device_id (i), device_id) == 0)
+			n_ids++;
+	}
+	g_assert_cmpuint (n_ids, ==, G_N_ELEMENTS (interface_ids));
+
+	/* and the identifier opens the camera of each interface through that interface */
+	for (i = 0; i < G_N_ELEMENTS (interface_ids); i++) {
+		GError *error = NULL;
+		ArvDevice *device = arv_open_device_on_interface (interface_ids[i], device_id, &error);
+
+		g_assert_no_error (error);
+		if (i == 0)
+			g_assert_true (ARV_IS_UV_DEVICE (device));
+		else
+			g_assert_true (ARV_IS_GV_DEVICE (device));
+		g_object_unref (device);
+	}
+
+	provider = gst_device_provider_factory_get_by_name ("aravisdeviceprovider");
+	g_assert_nonnull (provider);
+	devices = gst_device_provider_get_devices (provider);
+
+	for (iter = devices; iter != NULL; iter = iter->next) {
+		GstStructure *properties = gst_device_get_properties (iter->data);
+		const char *interface_id = gst_structure_get_string (properties, "aravis.interface");
+		char *element_interface_id = NULL;
+		char *camera_name = NULL;
+		ArvCamera *camera = NULL;
+		GstElement *element;
+		GstBus *bus;
+
+		g_test_message ("Provider: '%s' on %s", gst_structure_get_string (properties, "aravis.device-id"),
+				interface_id);
+
+		/* Not another GigEVision camera of the host's networks */
+		if (g_strcmp0 (gst_structure_get_string (properties, "aravis.device-id"), device_id) != 0) {
+			gst_structure_free (properties);
+			continue;
+		}
+
+		for (i = 0; i < G_N_ELEMENTS (interface_ids); i++)
+			if (g_strcmp0 (interface_id, interface_ids[i]) == 0)
+				break;
+		g_assert_cmpuint (i, <, G_N_ELEMENTS (interface_ids));
+		g_assert_false (listed[i]);
+		listed[i] = TRUE;
+
+		/* Its element selects the camera on the interface of the device, and opens it there when it starts */
+		element = gst_device_create_element (iter->data, NULL);
+		g_assert_nonnull (element);
+		gst_object_ref_sink (element);
+		bus = gst_bus_new ();
+		gst_element_set_bus (element, bus);
+
+		g_object_get (element, "interface", &element_interface_id, "camera-name", &camera_name, NULL);
+		g_assert_cmpstr (element_interface_id, ==, interface_ids[i]);
+		g_assert_cmpstr (camera_name, ==, device_id);
+
+		g_assert_cmpint (gst_element_set_state (element, GST_STATE_PAUSED), !=, GST_STATE_CHANGE_FAILURE);
+		g_object_get (element, "camera", &camera, NULL);
+		g_assert_nonnull (camera);
+		if (i == 0)
+			g_assert_true (ARV_IS_UV_DEVICE (arv_camera_get_device (camera)));
+		else
+			g_assert_true (ARV_IS_GV_DEVICE (arv_camera_get_device (camera)));
+		g_object_unref (camera);
+		g_assert_cmpint (gst_element_set_state (element, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+		g_assert_null (gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR));
+
+		gst_element_set_bus (element, NULL);
+		gst_object_unref (bus);
+		gst_object_unref (element);
+		g_free (element_interface_id);
+		g_free (camera_name);
+		gst_structure_free (properties);
+	}
+
+	for (i = 0; i < G_N_ELEMENTS (interface_ids); i++)
+		if (!listed[i])
+			g_error ("The provider does not list '%s' on %s", device_id, interface_ids[i]);
+
+	g_list_free_full (devices, gst_object_unref);
+	gst_object_unref (provider);
+
+	arv_disable_interface ("GigEVision");
+	g_object_unref (gv_camera);
+	g_free (device_id);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -1195,6 +1321,10 @@ main (int argc, char *argv[])
 	fakeuv_test_add ("/fakeuvgst/provider-while-streaming", provider_while_streaming_test);
 	fakeuv_test_add ("/fakeuvgst/provider-list-changes-twice", provider_list_changes_twice_test);
 	fakeuv_test_add ("/fakeuvgst/provider-duplicate-ids", provider_duplicate_ids_test);
+	/* With the fake GigEVision camera, which binds the fixed GigEVision ports: only in the test of the 'network'
+	 * suite */
+	if (g_strcmp0 (g_getenv ("FAKEUVGST_TEST_NETWORK"), "1") == 0)
+		fakeuv_test_add ("/fakeuvgst/provider-same-id-two-interfaces", provider_same_id_two_interfaces_test);
 
 	result = fakeuv_test_run ();
 

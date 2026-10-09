@@ -96,6 +96,8 @@ typedef struct {
 	ArvUvUsbMode usb_mode;
         guint64 maximum_transfer_size;
         gint raw_io_disabled;
+        /* Atomic, see arv_uv_device_get_raw_io () */
+        gint raw_io;
 
         /* Atomic, see arv_uv_device_take_stream_interface () */
         gint n_stream_interface_setups;
@@ -578,6 +580,8 @@ arv_uv_device_set_raw_io (ArvUvDevice *uv_device, gboolean enable)
                 return FALSE;
         }
 
+        g_atomic_int_set (&priv->raw_io, enable ? 1 : 0);
+
         arv_debug_device ("[UvDevice::set_raw_io] RAW_IO %s on endpoint 0x%02x", enable ? "on" : "off",
                           priv->data_endpoint);
 
@@ -587,6 +591,31 @@ arv_uv_device_set_raw_io (ArvUvDevice *uv_device, gboolean enable)
 
         return !enable;
 #endif
+}
+
+/*
+ * arv_uv_device_get_raw_io:
+ * @uv_device: a #ArvUvDevice
+ *
+ * The RAW_IO policy of the stream endpoint, as the last successful arv_uv_device_set_raw_io () left it. WinUSB keeps
+ * it as long as the device keeps its interface claimed, from one acquisition to the next, and resets it when the
+ * interface is claimed again (WinUsb_Initialize ()). A change that fails leaves it as it was: a stop that fails to turn
+ * RAW_IO off, the camera still there, leaves it on for the next acquisition, whose reads must then follow its rules, or
+ * turn it off first.
+ *
+ * Returns: %TRUE if RAW_IO is on.
+ */
+
+gboolean
+arv_uv_device_get_raw_io (ArvUvDevice *uv_device)
+{
+        ArvUvDevicePrivate *priv;
+
+        g_return_val_if_fail (ARV_IS_UV_DEVICE (uv_device), FALSE);
+
+        priv = arv_uv_device_get_instance_private (uv_device);
+
+        return g_atomic_int_get (&priv->raw_io) != 0;
 }
 
 /*

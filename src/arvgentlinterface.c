@@ -272,7 +272,7 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 		ArvGenTLModule * gentl = arv_gentl_system_get_gentl(gentl_system);
 		TL_HANDLE system_handle;
 		uint32_t num_interfaces;
-		char *tl_vendor, *tl_type;
+		char *producer_name, *tl_vendor, *tl_type;
 
 		/* No transport layer handle: the producer failed to open it, and is skipped */
 		system_handle = arv_gentl_system_open_system_handle(gentl_system);
@@ -283,9 +283,9 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 
 		/* The transport layer vendor is part of the device id. The producer file name is used if the producer
 		 * doesn't tell its vendor, which keeps the ids of a device seen by several producers distinct. */
-		tl_vendor = _take_string_or_fallback (_gentl_get_tl_info_str(gentl, system_handle, TL_INFO_VENDOR), NULL);
-		if (tl_vendor == NULL)
-			tl_vendor = _get_producer_name (gentl_system);
+		producer_name = _get_producer_name (gentl_system);
+		tl_vendor = _take_string_or_fallback (_gentl_get_tl_info_str(gentl, system_handle, TL_INFO_VENDOR),
+						      producer_name);
 		tl_type = _take_string_or_fallback (_gentl_get_tl_info_str(gentl, system_handle, TL_INFO_TLTYPE),
 						    "Custom");
 
@@ -318,7 +318,7 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 
 			/* Iterate over all devices of a GenTL interface */
 			for (uint32_t j=0; j<num_devices; j++) {
-				char *device_id, *id, *model, *vendor, *serial_nbr;
+				char *device_id, *id, *model, *vendor, *serial_nbr, *id_serial_nbr;
 				ArvGenTLInterfaceDeviceInfos *device_infos;
 				ArvInterfaceDeviceIds *ids;
 
@@ -330,8 +330,10 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 				}
 
 				/* The producer may not provide every string: the device id replaces a missing
-				 * DEVICE_INFO_ID, and a missing serial number in the Aravis device id, which then stays
-				 * unique. */
+				 * DEVICE_INFO_ID. A missing serial number is replaced in the Aravis device ids by the
+				 * producer file name, the interface id and the device id: a GenTL device id is only
+				 * unique in its interface, two interfaces may each have a "Device0", and a vendor may
+				 * ship several producers. */
 				id = _take_string_or_fallback (_gentl_get_info_str(gentl->IFGetDeviceInfo,
 										  interface_handle, device_id,
 										  DEVICE_INFO_ID),
@@ -349,9 +351,15 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 											  DEVICE_INFO_SERIAL_NUMBER),
 								       "");
 
+				if (serial_nbr[0] != '\0')
+					id_serial_nbr = g_strdup (serial_nbr);
+				else
+					id_serial_nbr = g_strdup_printf ("%s-%s-%s", producer_name, interface_id,
+									 device_id);
+
 				device_infos =  arv_gentl_interface_device_infos_new(gentl_system, tl_vendor, interface_id, id,
-                                                                                    vendor, model,
-										    serial_nbr[0] != '\0' ? serial_nbr : device_id);
+                                                                                    vendor, model, id_serial_nbr);
+				g_free (id_serial_nbr);
                                 arv_info_interface ("[GentTLInterface::discovery] Device '%s' found",
                                                     device_infos->id);
 
@@ -395,6 +403,7 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 		}
 		arv_gentl_system_close_system_handle(gentl_system);
 
+		g_free (producer_name);
 		g_free (tl_vendor);
 		g_free (tl_type);
 	}

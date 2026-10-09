@@ -489,10 +489,12 @@ _gentl_buffer_to_arv_buffer(ArvGenTLModule *gentl, DS_HANDLE datastream, BUFFER_
 
 		arv_buffer->priv->parts[0].component_id = 0;
 		arv_buffer->priv->parts[0].data_type = ARV_BUFFER_PART_DATA_TYPE_2D_IMAGE;
-		arv_buffer->priv->parts[0].size = data_size;
 
+		/* The data size counts the data from the start of the buffer, and the image starts at the image offset in
+		 * it, after chunk data or an alignment gap for example: the image part ends with the data */
 		_gentl_buffer_info_sizet(gentl, datastream, gentl_buffer, BUFFER_INFO_IMAGEOFFSET, &image_offset);
 		arv_buffer->priv->parts[0].data_offset = image_offset;
+		arv_buffer->priv->parts[0].size = data_size > image_offset ? data_size - image_offset : 0;
 
 		_gentl_buffer_info_uint64(gentl, datastream, gentl_buffer, BUFFER_INFO_PIXELFORMAT, &pixel_format);
 		arv_buffer->priv->parts[0].pixel_format = pixel_format;

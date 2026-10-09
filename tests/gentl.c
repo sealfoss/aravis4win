@@ -15,6 +15,7 @@
 
 #include <arv.h>
 #include <arvgentlprivate.h>
+#include <arvgvcpprivate.h>
 #include <gmodule.h>
 #include <glib/gstdio.h>
 #include <string.h>
@@ -26,11 +27,17 @@
 #define MOCK_MINIMAL_DEVICE_ID	ARV_GENTL_MOCK_TL_VENDOR "Minimal" MOCK_ID_SUFFIX
 #define MOCK_DEP_DEVICE_ID	ARV_GENTL_MOCK_TL_VENDOR "Dep" MOCK_ID_SUFFIX
 
-/* Device id built with the GenTL device id when the producer tells no serial number */
-#define MOCK_NO_SERIAL_DEVICE_ID	ARV_GENTL_MOCK_TL_VENDOR "-" ARV_GENTL_MOCK_VENDOR "-" ARV_GENTL_MOCK_MODEL "-" \
-					ARV_GENTL_MOCK_GENTL_DEVICE_ID "0"
-/* Device id built from the producer file name and the GenTL device id, when the producer tells no string at all */
-#define MOCK_NO_STRING_DEVICE_ID	"ArvGenTLMock---" ARV_GENTL_MOCK_GENTL_DEVICE_ID "0"
+/* Device id built with the producer file name, the GenTL interface id and the GenTL device id when the producer tells
+ * no serial number */
+#define MOCK_NO_SERIAL_ID_SUFFIX(interface_index) \
+	"-" ARV_GENTL_MOCK_INTERFACE_ID_PREFIX interface_index "-" ARV_GENTL_MOCK_GENTL_DEVICE_ID "0"
+#define MOCK_NO_SERIAL_DEVICE_ID	ARV_GENTL_MOCK_TL_VENDOR "-" ARV_GENTL_MOCK_VENDOR "-" ARV_GENTL_MOCK_MODEL \
+					"-ArvGenTLMock" MOCK_NO_SERIAL_ID_SUFFIX ("0")
+#define MOCK_NO_SERIAL_DEVICE_ID_IF1	ARV_GENTL_MOCK_TL_VENDOR "-" ARV_GENTL_MOCK_VENDOR "-" ARV_GENTL_MOCK_MODEL \
+					"-ArvGenTLMock" MOCK_NO_SERIAL_ID_SUFFIX ("1")
+/* Device id built from the producer file name, the GenTL interface id and the GenTL device id, when the producer
+ * tells no string at all */
+#define MOCK_NO_STRING_DEVICE_ID	"ArvGenTLMock---ArvGenTLMock" MOCK_NO_SERIAL_ID_SUFFIX ("0")
 
 #define MOCK_FRAME_PERIOD_US		"10000"
 #define FRAME_TIMEOUT_US		(10 * G_USEC_PER_SEC)
@@ -62,6 +69,7 @@
 
 static const char *mock_options[] = {
 	"ARV_GENTL_MOCK_N_DEVICES",
+	"ARV_GENTL_MOCK_N_INTERFACES",
 	"ARV_GENTL_MOCK_MISSING_INFO",
 	"ARV_GENTL_MOCK_EMPTY_INFO",
 	"ARV_GENTL_MOCK_FAIL",
@@ -72,7 +80,8 @@ static const char *mock_options[] = {
 	"ARV_GENTL_MOCK_N_PARTS",
 	"ARV_GENTL_MOCK_CLOSE_DELAY_US",
 	"ARV_GENTL_MOCK_DEVICE_EVENT_ID",
-	"ARV_GENTL_MOCK_SIZE_EXCESS"
+	"ARV_GENTL_MOCK_SIZE_EXCESS",
+	"ARV_GENTL_MOCK_IMAGE_OFFSET"
 };
 
 static const char *
@@ -517,6 +526,221 @@ empty_strings_test (void)
 			       "TL_INFO_VENDOR,TL_INFO_TLTYPE,INTERFACE_INFO_DISPLAYNAME,INTERFACE_INFO_TLTYPE,"
 			       "DEVICE_INFO_ID,DEVICE_INFO_VENDOR,DEVICE_INFO_MODEL,DEVICE_INFO_TLTYPE,"
 			       "DEVICE_INFO_DISPLAYNAME,DEVICE_INFO_SERIAL_NUMBER");
+}
+
+/* Serial number of the fake camera behind a device, read from its registers: it tells which mock camera the device
+ * is, whether the producer tells the serial numbers or not */
+
+static char *
+dup_camera_serial_number (ArvDevice *device)
+{
+	char serial_number[ARV_GVBS_SERIAL_NUMBER_SIZE + 1] = {0};
+	GError *error = NULL;
+
+	arv_device_read_memory (device, ARV_GVBS_SERIAL_NUMBER_OFFSET, ARV_GVBS_SERIAL_NUMBER_SIZE, serial_number,
+				&error);
+	g_assert_no_error (error);
+
+	return g_strdup (serial_number);
+}
+
+/* Ids of the listed mock devices, in the order of the device list */
+
+static GPtrArray *
+dup_mock_device_ids (void)
+{
+	GPtrArray *ids = g_ptr_array_new_with_free_func (g_free);
+	unsigned int n_devices = arv_get_n_devices ();
+	unsigned int i;
+
+	for (i = 0; i < n_devices; i++)
+		if (g_str_has_prefix (arv_get_device_id (i), ARV_GENTL_MOCK_TL_VENDOR))
+			g_ptr_array_add (ids, g_strdup (arv_get_device_id (i)));
+
+	return ids;
+}
+
+/* Opens each id in turn, and returns the serial numbers of the cameras reached */
+
+static GPtrArray *
+dup_reached_cameras (GPtrArray *ids)
+{
+	GPtrArray *serial_numbers = g_ptr_array_new_with_free_func (g_free);
+	guint i;
+
+	for (i = 0; i < ids->len; i++) {
+		ArvDevice *device;
+		GError *error = NULL;
+
+		device = arv_open_device (g_ptr_array_index (ids, i), &error);
+		g_assert_no_error (error);
+		g_assert_true (ARV_IS_GENTL_DEVICE (device));
+		g_ptr_array_add (serial_numbers, dup_camera_serial_number (device));
+		g_object_unref (device);
+	}
+
+	return serial_numbers;
+}
+
+/* Two interfaces of a producer expose the same GenTL device id, with the same vendor and model: each listed device
+ * must have its own id, which opens its own camera. The cameras of interfaces 0 and 1 are MOCK0 and MOCK0-IF1. */
+
+static void
+check_interfaces_with_same_device_id (gboolean has_serial_numbers)
+{
+	GPtrArray *ids;
+	GPtrArray *cameras;
+	const char *mock_path;
+	guint i;
+
+	GET_TEST_PATH_OR_SKIP (mock_path, "ARV_TEST_GENTL_MOCK");
+
+	setup_environment (mock_path);
+	g_setenv ("ARV_GENTL_MOCK_N_INTERFACES", "2", TRUE);
+	if (!has_serial_numbers)
+		g_setenv ("ARV_GENTL_MOCK_MISSING_INFO", "DEVICE_INFO_SERIAL_NUMBER", TRUE);
+	arv_enable_interface ("GenTL");
+
+	arv_update_device_list ();
+
+	ids = dup_mock_device_ids ();
+	cameras = dup_reached_cameras (ids);
+	for (i = 0; i < ids->len; i++)
+		g_test_message ("Listed device %u: '%s' opens camera '%s'", i,
+				(const char *) g_ptr_array_index (ids, i),
+				(const char *) g_ptr_array_index (cameras, i));
+
+	g_assert_cmpuint (ids->len, ==, 2);
+	g_assert_cmpstr (g_ptr_array_index (ids, 0), !=, g_ptr_array_index (ids, 1));
+	/* Listed interface by interface */
+	g_assert_cmpstr (g_ptr_array_index (cameras, 0), ==, ARV_GENTL_MOCK_SERIAL "0");
+	g_assert_cmpstr (g_ptr_array_index (cameras, 1), ==, ARV_GENTL_MOCK_SERIAL "0-IF1");
+
+	if (!has_serial_numbers) {
+		g_assert_cmpstr (g_ptr_array_index (ids, 0), ==, MOCK_NO_SERIAL_DEVICE_ID);
+		g_assert_cmpstr (g_ptr_array_index (ids, 1), ==, MOCK_NO_SERIAL_DEVICE_ID_IF1);
+		for (i = 0; i < ids->len; i++)
+			g_assert_cmpstr (arv_get_device_serial_nbr (find_device (g_ptr_array_index (ids, i))), ==, "");
+	}
+
+	g_ptr_array_unref (cameras);
+	g_ptr_array_unref (ids);
+
+	teardown_environment ();
+}
+
+static void
+interfaces_same_device_id_test (void)
+{
+	check_interfaces_with_same_device_id (TRUE);
+}
+
+static void
+missing_serial_number_interfaces_test (void)
+{
+	check_interfaces_with_same_device_id (FALSE);
+}
+
+/* Two producers with the same transport layer vendor expose the same GenTL device id, with the same vendor and model:
+ * a copy of the mock producer, under another name, which is another library. Each listed device must have its own
+ * id, which opens a camera of its own producer. The fake cameras of both producers are alike: the producer of the
+ * camera reached is told by their open device counter. */
+
+static char *
+copy_producer (const char *source_path, const char *directory, const char *basename)
+{
+	GFile *source;
+	GFile *destination;
+	GError *error = NULL;
+	char *destination_path;
+
+	destination_path = g_build_filename (directory, basename, NULL);
+
+	source = g_file_new_for_path (source_path);
+	destination = g_file_new_for_path (destination_path);
+	g_file_copy (source, destination, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &error);
+	g_assert_no_error (error);
+
+	g_object_unref (source);
+	g_object_unref (destination);
+
+	return destination_path;
+}
+
+static void
+missing_serial_number_producers_test (void)
+{
+	MockControl *controls[2];
+	GPtrArray *ids;
+	GError *error = NULL;
+	const char *mock_path;
+	char *directory;
+	char *copy_path;
+	char *gentl_path;
+	guint producers[2] = {0, 0};
+	guint i;
+
+	GET_TEST_PATH_OR_SKIP (mock_path, "ARV_TEST_GENTL_MOCK");
+
+	directory = g_dir_make_tmp ("arv-gentl-test-XXXXXX", &error);
+	g_assert_no_error (error);
+	copy_path = copy_producer (mock_path, directory, "ArvGenTLMockCopy.cti");
+	gentl_path = g_strjoin (G_SEARCHPATH_SEPARATOR_S, mock_path, copy_path, NULL);
+
+	controls[0] = mock_control_new (mock_path);
+	controls[1] = mock_control_new (copy_path);
+
+	setup_environment (gentl_path);
+	g_setenv ("ARV_GENTL_MOCK_MISSING_INFO", "DEVICE_INFO_SERIAL_NUMBER", TRUE);
+	arv_enable_interface ("GenTL");
+
+	arv_update_device_list ();
+	g_assert_cmpint (controls[0]->get_counter ("GCInitLib"), ==, 1);
+	g_assert_cmpint (controls[1]->get_counter ("GCInitLib"), ==, 1);
+
+	/* The producers are listed in an arbitrary order */
+	ids = dup_mock_device_ids ();
+	g_assert_cmpuint (ids->len, ==, 2);
+	for (i = 0; i < ids->len; i++) {
+		ArvDevice *device;
+
+		device = arv_open_device (g_ptr_array_index (ids, i), &error);
+		g_assert_no_error (error);
+		g_assert_true (ARV_IS_GENTL_DEVICE (device));
+
+		producers[i] = controls[0]->get_counter ("open-devices") == 1 ? 0 : 1;
+		g_assert_cmpint (controls[producers[i]]->get_counter ("open-devices"), ==, 1);
+
+		g_test_message ("Listed device %u: '%s' opens the camera of producer %u", i,
+				(const char *) g_ptr_array_index (ids, i), producers[i]);
+
+		g_object_unref (device);
+	}
+
+	g_assert_cmpstr (g_ptr_array_index (ids, 0), !=, g_ptr_array_index (ids, 1));
+	g_assert_cmpuint (producers[0], !=, producers[1]);
+	for (i = 0; i < ids->len; i++)
+		g_assert_cmpstr (g_ptr_array_index (ids, i), ==,
+				 producers[i] == 0 ?
+				 MOCK_NO_SERIAL_DEVICE_ID :
+				 ARV_GENTL_MOCK_TL_VENDOR "-" ARV_GENTL_MOCK_VENDOR "-" ARV_GENTL_MOCK_MODEL
+				 "-ArvGenTLMockCopy" MOCK_NO_SERIAL_ID_SUFFIX ("0"));
+
+	g_ptr_array_unref (ids);
+
+	teardown_environment ();
+
+	assert_no_violation (controls[0]);
+	assert_no_violation (controls[1]);
+	mock_control_free (controls[0]);
+	mock_control_free (controls[1]);
+
+	/* Best effort, the library may still be mapped */
+	g_unlink (copy_path);
+	g_rmdir (directory);
+	g_free (gentl_path);
+	g_free (copy_path);
+	g_free (directory);
 }
 
 /* A producer without the functions the consumer never calls, or can do without, is loaded and streams */
@@ -1674,6 +1898,160 @@ oversized_frame_test (void)
 		assert_no_violation (control);
 
 		mock_control_free (control);
+	}
+}
+
+/* A producer telling an image offset, the data before the image being for example chunk data: the data sizes
+ * (BUFFER_INFO_DATA_SIZE, BUFFER_INFO_SIZE_FILLED) count the data from the start of the buffer, these bytes included.
+ * The part built from the buffer informations, without the multi-part functions, started at the offset but was as
+ * large as the whole data: a complete frame filling its buffer came back as a SIZE_MISMATCH failure. The camera tells
+ * a payload size counting the data before the image, as a camera whose payload starts with chunk data. With the zero
+ * offset as well, and with the multi-part functions, which describe the image alone. */
+
+#define MOCK_IMAGE_OFFSET		64
+#define FAKE_PAYLOAD_SIZE_FORMULA	"WIDTH * HEIGHT * ((PIXELFORMAT>>16)&amp;0xFF) / 8"
+
+/* Writes the GenICam description of the fake camera with a payload size larger by @excess bytes. Returns the path of
+ * the file. */
+
+static char *
+write_genicam_file_with_payload_excess (guint excess)
+{
+	ArvFakeCamera *camera;
+	const char *xml;
+	const char *formula;
+	char *contents;
+	char *path = NULL;
+	GError *error = NULL;
+	size_t size = 0;
+	int fd;
+
+	camera = arv_fake_camera_new ("GENICAM0");
+	xml = arv_fake_camera_get_genicam_xml (camera, &size);
+	g_assert_nonnull (xml);
+
+	formula = g_strstr_len (xml, size, FAKE_PAYLOAD_SIZE_FORMULA);
+	g_assert_nonnull (formula);
+	contents = g_strdup_printf ("%.*s" FAKE_PAYLOAD_SIZE_FORMULA " + %u%s", (int) (formula - xml), xml, excess,
+				    formula + strlen (FAKE_PAYLOAD_SIZE_FORMULA));
+	g_object_unref (camera);
+
+	fd = g_file_open_tmp ("arv-gentl-test-XXXXXX.xml", &path, &error);
+	g_assert_no_error (error);
+	g_close (fd, NULL);
+	g_assert_true (g_file_set_contents (path, contents, -1, &error));
+	g_assert_no_error (error);
+	g_free (contents);
+
+	return path;
+}
+
+static void
+check_offset_image (ArvBuffer *buffer, size_t image_offset)
+{
+	const guint8 *data;
+	const guint8 *image;
+	size_t size = 0;
+	size_t image_size = 0;
+	size_t i;
+	guint x, y;
+
+	g_assert_true (ARV_IS_BUFFER (buffer));
+	g_assert_cmpint (arv_buffer_get_status (buffer), ==, ARV_BUFFER_STATUS_SUCCESS);
+	g_assert_cmpint (arv_buffer_get_payload_type (buffer), ==, ARV_BUFFER_PAYLOAD_TYPE_IMAGE);
+	g_assert_cmpint (arv_buffer_get_image_width (buffer), ==, ARV_FAKE_CAMERA_WIDTH_DEFAULT);
+	g_assert_cmpint (arv_buffer_get_image_height (buffer), ==, ARV_FAKE_CAMERA_HEIGHT_DEFAULT);
+	g_assert_cmpint (arv_buffer_get_image_pixel_format (buffer), ==, ARV_PIXEL_FORMAT_MONO_8);
+
+	/* The data, from the start of the buffer */
+	data = arv_buffer_get_data (buffer, &size);
+	g_assert_nonnull (data);
+	g_assert_cmpuint (size, ==, image_offset + ARV_FAKE_CAMERA_WIDTH_DEFAULT * ARV_FAKE_CAMERA_HEIGHT_DEFAULT);
+	for (i = 0; i < image_offset; i++)
+		g_assert_cmpuint (data[i], ==, ARV_GENTL_MOCK_IMAGE_OFFSET_FILL);
+
+	/* The image alone, the diagonal ramp of the fake camera */
+	g_assert_cmpuint (arv_buffer_get_n_parts (buffer), ==, 1);
+	image = arv_buffer_get_image_data (buffer, &image_size);
+	g_assert_true (image == data + image_offset);
+	g_assert_cmpuint (image_size, ==, ARV_FAKE_CAMERA_WIDTH_DEFAULT * ARV_FAKE_CAMERA_HEIGHT_DEFAULT);
+	for (y = 0; y < ARV_FAKE_CAMERA_HEIGHT_DEFAULT; y++)
+		for (x = 0; x < ARV_FAKE_CAMERA_WIDTH_DEFAULT; x++)
+			if (image[y * ARV_FAKE_CAMERA_WIDTH_DEFAULT + x] != (x + y + image[0]) % 255)
+				g_assert_cmpuint (image[y * ARV_FAKE_CAMERA_WIDTH_DEFAULT + x], ==,
+						  (x + y + image[0]) % 255);
+}
+
+static void
+image_offset_test (void)
+{
+	static const char *n_parts_options[] = {"none", "1"};
+	static const guint image_offsets[] = {0, MOCK_IMAGE_OFFSET};
+	/* Sizes of the buffers allocated by Aravis, beyond the payload size */
+	static const guint buffer_excesses[] = {0, MOCK_IMAGE_OFFSET / 2, 4096};
+	const char *mock_path;
+	guint i, j, k;
+
+	GET_TEST_PATH_OR_SKIP (mock_path, "ARV_TEST_GENTL_MOCK");
+
+	for (i = 0; i < G_N_ELEMENTS (image_offsets); i++) {
+		char *image_offset = g_strdup_printf ("%u", image_offsets[i]);
+
+		for (j = 0; j < G_N_ELEMENTS (n_parts_options); j++) {
+			MockControl *control;
+			ArvCamera *camera;
+			ArvStream *stream;
+			GError *error = NULL;
+			char *genicam_path;
+			gint payload;
+
+			g_test_message ("Image offset %u, parts: %s", image_offsets[i], n_parts_options[j]);
+
+			control = mock_control_new (mock_path);
+			setup_environment (mock_path);
+			g_setenv ("ARV_GENTL_MOCK_N_PARTS", n_parts_options[j], TRUE);
+			g_setenv ("ARV_GENTL_MOCK_IMAGE_OFFSET", image_offset, TRUE);
+
+			/* Read by the fake camera of the mock, created by IFOpenDevice */
+			genicam_path = write_genicam_file_with_payload_excess (image_offsets[i]);
+			arv_set_fake_camera_genicam_filename (genicam_path);
+			camera = open_mock_camera ();
+			arv_set_fake_camera_genicam_filename (NULL);
+			g_remove (genicam_path);
+			g_free (genicam_path);
+
+			payload = arv_camera_get_payload (camera, &error);
+			g_assert_no_error (error);
+			g_assert_cmpint (payload, ==, image_offsets[i] +
+					 ARV_FAKE_CAMERA_WIDTH_DEFAULT * ARV_FAKE_CAMERA_HEIGHT_DEFAULT);
+
+			/* Buffers of the payload size, which the frames fill, allocated by the producer, and by Aravis.
+			 * And larger ones: the image part must not take the bytes after the data. */
+			stream = create_mock_stream (camera, N_STREAM_BUFFERS);
+			for (k = 0; k < G_N_ELEMENTS (buffer_excesses); k++)
+				arv_stream_push_buffer (stream, arv_buffer_new_allocate (payload + buffer_excesses[k]));
+			start_acquisition (camera);
+
+			for (k = 0; k < 2 * (N_STREAM_BUFFERS + G_N_ELEMENTS (buffer_excesses)); k++) {
+				ArvBuffer *buffer = arv_stream_timeout_pop_buffer (stream, FRAME_TIMEOUT_US);
+
+				check_offset_image (buffer, image_offsets[i]);
+				arv_stream_push_buffer (stream, buffer);
+			}
+			g_assert_cmpuint (arv_stream_get_info_uint64_by_name (stream, "n_failures"), ==, 0);
+
+			stop_acquisition (camera);
+
+			g_object_unref (stream);
+			g_object_unref (camera);
+
+			teardown_environment ();
+			assert_no_violation (control);
+
+			mock_control_free (control);
+		}
+
+		g_free (image_offset);
 	}
 }
 
@@ -2945,6 +3323,9 @@ main (int argc, char *argv[])
 	g_test_add_func ("/gentl/discovery/missing-serial-number", missing_serial_number_test);
 	g_test_add_func ("/gentl/discovery/missing-strings", missing_strings_test);
 	g_test_add_func ("/gentl/discovery/empty-strings", empty_strings_test);
+	g_test_add_func ("/gentl/discovery/interfaces-same-device-id", interfaces_same_device_id_test);
+	g_test_add_func ("/gentl/discovery/missing-serial-number-interfaces", missing_serial_number_interfaces_test);
+	g_test_add_func ("/gentl/discovery/missing-serial-number-producers", missing_serial_number_producers_test);
 	g_test_add_func ("/gentl/load/optional-functions", optional_functions_test);
 	g_test_add_func ("/gentl/load/missing-function", missing_function_test);
 	g_test_add_func ("/gentl/load/invalid-producer", invalid_producer_test);
@@ -2965,6 +3346,7 @@ main (int argc, char *argv[])
 	g_test_add_func ("/gentl/stream/start-failure", start_failure_test);
 	g_test_add_func ("/gentl/stream/incomplete-frame", incomplete_frame_test);
 	g_test_add_func ("/gentl/stream/oversized-frame", oversized_frame_test);
+	g_test_add_func ("/gentl/stream/image-offset", image_offset_test);
 	g_test_add_func ("/gentl/stream/flushed-buffers", flushed_buffers_test);
 	g_test_add_func ("/gentl/producer/api", producer_api_test);
 	g_test_add_func ("/gentl/producer/discovery", producer_discovery_test);

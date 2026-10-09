@@ -1890,6 +1890,20 @@ arv_uv_stream_start_acquisition (ArvStream *stream, GError **error)
         }
         thread_data->raw_io_maximum = raw_io ? raw_io_maximum : 0;
 
+        /* RAW_IO still on: an earlier acquisition of the device failed to turn it off at its stop, the camera still
+         * there (arv_uv_device_get_raw_io ()). WinUSB would reject the reads below, which are not whole packets. Turned
+         * off before anything is written to the camera, with nothing in flight; if it cannot be, nothing could be
+         * read. */
+        if (!raw_io && arv_uv_device_get_raw_io (thread_data->uv_device)) {
+                if (!arv_uv_device_set_raw_io (thread_data->uv_device, FALSE)) {
+                        g_set_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_TRANSFER_ERROR,
+                                     "WinUSB RAW_IO, left on by an earlier acquisition, could not be turned off, "
+                                     "and would reject the stream reads: try again, or reopen the device");
+                        return FALSE;
+                }
+                arv_info_stream ("RAW_IO, left on by an earlier acquisition, turned off");
+        }
+
         if (raw_io)
                 transfer_size = MIN (maximum_transfer_size, thread_data->raw_io_maximum) / packet_unit * packet_unit;
         else if (packet_unit > 0 && packet_unit <= maximum_transfer_size)
@@ -2070,7 +2084,8 @@ arv_uv_stream_stop_acquisition (ArvStream *stream, GError **error)
         }
 
         /* The stream thread has taken every transfer back before returning: RAW_IO can change now. Unless the thread
-         * turned it off already. */
+         * turned it off already. If this fails, the device knows RAW_IO is still on, and the next start that goes
+         * without it turns it off first. */
         if (raw_io && arv_uv_device_is_connected (thread_data->uv_device))
                 arv_uv_device_set_raw_io (thread_data->uv_device, FALSE);
 

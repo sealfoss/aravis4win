@@ -667,7 +667,8 @@ test_packet_check (ArvDevice *device,
  * being fragmented is as large as its MTU. Test packets can't tell: the host may reassemble fragmented test packets,
  * and some network adapters accept oversized frames. When the MTU is known, a larger @packet_size is lowered to the
  * largest size of the search grid fitting in the MTU, even without test function, and if the MTU is smaller than
- * @max_size, it caps the search, which starts from the cap. Without a known MTU, the search is unchanged.
+ * @max_size, it caps the search, which starts from the cap. If even @min_size is larger than the MTU, no size of the
+ * grid fits: the cap is @min_size, and a warning is logged. Without a known MTU, the search is unchanged.
  *
  * Returns: the packet size to use.
  */
@@ -691,7 +692,7 @@ arv_gv_device_search_packet_size (guint packet_size,
 	if (mtu > 0) {
 		guint cap;
 
-		/* Largest packet size of the search grid fitting in the MTU */
+		/* Largest packet size of the search grid fitting in the MTU, or the smallest one if none fits */
 		cap = MIN (mtu, max_size);
 		cap = cap > min_size ? min_size + ((cap - min_size) / inc) * inc : min_size;
 
@@ -701,10 +702,20 @@ arv_gv_device_search_packet_size (guint packet_size,
 		}
 
 		if (packet_size > mtu && packet_size > cap) {
-			arv_info_device ("[GvDevice::auto_packet_size] Packet size lowered from %u to %u bytes, "
-					 "to fit in the interface MTU (%u bytes)", packet_size, cap, mtu);
+			if (cap <= mtu)
+				arv_info_device ("[GvDevice::auto_packet_size] Packet size lowered from %u to %u bytes, "
+						 "to fit in the interface MTU (%u bytes)", packet_size, cap, mtu);
+			else
+				arv_info_device ("[GvDevice::auto_packet_size] Packet size lowered from %u to %u bytes, "
+						 "the smallest packet size of the device", packet_size, cap);
 			packet_size = cap;
 		}
+
+		/* Only when the smallest packet size is larger than the MTU */
+		if (packet_size > mtu)
+			arv_warning_device ("[GvDevice::auto_packet_size] The interface MTU (%u bytes) is smaller than the "
+					    "smallest packet size of the device (%u bytes): data packets may be dropped. "
+					    "Increase the MTU of the interface.", mtu, min_size);
 	}
 
 	if (test_func == NULL)
@@ -959,10 +970,11 @@ auto_packet_size (ArvGvDevice *gv_device, gboolean exit_early, GError **error)
  *
  * Automatically determine the biggest packet size that can be used data streaming, and set ArvGevSCPSPacketSize value
  * accordingly. This function relies on the GevSCPSFireTestPacket feature. When the operating system reports the MTU of
- * the network interface the device is reached through, the packet size never exceeds it.
+ * the network interface the device is reached through, the packet size does not exceed it, unless even the smallest
+ * packet size of the device is larger: no packet size fits, the smallest one is used, and a warning is logged.
  *
  * Returns: The automatic packet size, in bytes, or the current one if GevSCPSFireTestPacket is not supported, lowered
- * to the interface MTU if larger.
+ * as above if larger than the interface MTU.
  *
  * Since: 0.6.0
  */
@@ -982,7 +994,8 @@ arv_gv_device_auto_packet_size (ArvGvDevice *gv_device, GError **error)
  * arv_gv_device_auto_packet_size() for a description of the packet adjustment feature. The default behaviour is
  * @ARV_GV_PACKET_SIZE_ADJUSTEMENT_ON_FAILURE_ONCE, which means the packet size is adjusted if the current packet size
  * check fails, and only the first time arv_device_create_stream() is successfully called during @gv_device instance
- * life. An adjustment also lowers a current packet size larger than the MTU of the host network interface.
+ * life. An adjustment also lowers a current packet size larger than the MTU of the host network interface, as far as
+ * the smallest packet size of the device allows.
  *
  * Since: 0.8.3
  */

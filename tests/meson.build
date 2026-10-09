@@ -85,6 +85,14 @@ if get_option('tests')
 		      suite: 'packaging', timeout: 180)
 	endif
 
+	# Windows zips: runs .github/scripts/package-windows.py on a fake install
+	# tree. The README must link to the sources of the repository that the
+	# workflows build, which may be a fork, at the built revision.
+	package_windows_python = import ('python').find_installation ()
+	test ('package-windows', package_windows_python,
+	      args: [files ('packagewindows.py'), meson.project_source_root ()],
+	      suite: 'packaging', timeout: 60)
+
 	# USB3 Vision throughput benchmark: unit-tests the parser of
 	# scripts/arv-usb-benchmark.py on outputs of arv-camera-test saved in
 	# tests/data, its matrix, dry run and reports, and runs it against the Fake
@@ -252,6 +260,15 @@ if get_option('tests')
 				test ('fakeuvgst', fakeuv_gst, suite: ['fakeuv', 'fakeuvgst'], timeout: 120,
 				      env: ['GST_PLUGIN_SYSTEM_PATH_1_0=', 'GST_PLUGIN_PATH_1_0=', 'GST_PLUGIN_PATH=',
 					    'GST_REGISTRY_1_0=' + meson.current_build_dir () / 'fakeuvgst-registry.bin'])
+				# Its case with the in-process fake GigEVision camera on 127.0.0.1 too, which binds the fixed
+				# GigEVision ports, as the 'fakegv' test does: in the 'network' suite, and never in parallel. In
+				# the 'fakeuvgst' suite too, so that the valgrind setup leaves it out.
+				test ('fakeuvgst-network', fakeuv_gst, suite: ['network', 'fakeuvgst'], timeout: 120,
+				      is_parallel: false,
+				      args: ['-p', '/fakeuvgst/provider-same-id-two-interfaces'],
+				      env: ['GST_PLUGIN_SYSTEM_PATH_1_0=', 'GST_PLUGIN_PATH_1_0=', 'GST_PLUGIN_PATH=',
+					    'GST_REGISTRY_1_0=' + meson.current_build_dir () / 'fakeuvgst-network-registry.bin',
+					    'FAKEUVGST_TEST_NETWORK=1'])
 			endif
 		endif
 	endif

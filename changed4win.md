@@ -2,7 +2,7 @@
 
 This branch implements the 21-item Windows fix plan for Aravis, three items of it in part. It also fixes the 13 rows of the plan's "Also found" table and the defects found during the work. Its base is upstream `main` at `de17cdde` (3 Oct 2026, version 0.9.3) plus the fork's commits up to `ef8ac13d`. It was built and tested against fakes on one Windows 11 machine, with MSVC and MinGW, and cross-built for Linux. Nothing ran against a real camera, real WinUSB or GigE traffic, on Linux or macOS, or in CI: GitHub Actions has never run on the fork.
 
-The work is one commit on top of `ef8ac13d`: 140 files, +48,719 and −1,435 lines.
+The work is two commits on top of `ef8ac13d`: the implementation, `8d517b7a` (140 files, +48,719 and −1,435 lines), and the fixes of an external audit of that commit (see [the audit](#from-the-audit-of-9-october-2026)).
 
 ## Protocol-code rule
 
@@ -63,6 +63,7 @@ Aravis's README asks that contributions to `src/arvuv*.[ch]` and `src/arvgv*.[ch
 - **Transfer size validation.** `arv_camera_uv_set_maximum_transfer_size ()` and `arv_uv_device_set_maximum_transfer_size ()` accept 0 (the default, 1 MiB) or 1024 to 67108864 bytes. Other sizes give a warning, and the previous size is kept.
 - Each start rounds the transfer size down to a multiple of both the camera alignment and the endpoint packet size. This applies on every platform, with RAW_IO on or off. Up to 8 times the maximum transfer size of reads stay in flight, as before.
 - **Large memory writes.** Write blocks now fit the camera's maximum command packet. Before, with 1024-byte command packets, memory writes of 1005 bytes or more failed without a GError.
+- **RAW_IO left on.** If turning RAW_IO off fails at a stop, the device remembers that it is still on, and the next acquisition without RAW_IO turns it off before reading, or fails to start with `ARV_DEVICE_ERROR_TRANSFER_ERROR`.
 - **Unplug.** On Windows without hotplug, a removal now emits `control-lost`: during streaming, or at the first failed register access when idle. Later register accesses fail at once with `ARV_DEVICE_ERROR_NOT_CONNECTED`. Each buffer comes back exactly once, failed or aborted, or is still in the input queue. No thread spins.
 - **Logs.** At the `device` info level, the libusb version and whether hotplug is available. At the `stream` info level, at each start: transfer size, packet size, RAW_IO state and read layout, plus the bytes in flight in async mode.
 - The "Failed to set auto kernel detach feature" warning no longer appears on Windows and the BSDs.
@@ -71,7 +72,7 @@ Aravis's README asks that contributions to `src/arvuv*.[ch]` and `src/arvgv*.[ch
 
 ### GigE Vision
 
-- **Packet size and MTU.** The automatic packet size never exceeds the MTU of the host interface, when the system reports it. A larger stored size is lowered to the largest valid packet size not above the MTU, even on cameras without `GevSCPSFireTestPacket`.
+- **Packet size and MTU.** When the system reports the MTU of the host interface, the automatic packet size does not exceed it, unless even the camera's smallest packet size is larger. A larger stored size is lowered to the largest valid packet size not above the MTU, even on cameras without `GevSCPSFireTestPacket`. If no valid packet size fits, the smallest one is used, and a `device` warning names the MTU and that size.
 - A setup that relied on packets above the MTU, through a lenient network adapter, now gets MTU-sized packets. The `never` adjustment mode (`--packet-size-adjustment=never` of `arv-camera-test`) keeps the old size.
 - **Diagnosis.** A new stream statistic, `n_leader_trailer_only_failures`, counts frames that failed with only their leader and trailer. A rate-limited warning names the packet size and the MTU.
 - The last frame of an acquisition whose first data packet was lost now times out once its trailer has arrived, instead of staying pending.
@@ -79,12 +80,14 @@ Aravis's README asks that contributions to `src/arvuv*.[ch]` and `src/arvgv*.[ch
 - An application that keeps an old stream across a new stream's creation no longer disables the new stream's channel when it releases the old one.
 - On Linux, the packet socket ignores IP fragments and truncated captures, counts them in `n_ignored_packets`, and warns once.
 - `arv-fake-gv-camera --gvsp-mtu` drops GVSP packets larger than an emulated path MTU.
-- The documentation of `arv_camera_gv_auto_packet_size ()` now matches the code: without a test packet, the current size is kept, then capped at the MTU.
+- The documentation of `arv_camera_gv_auto_packet_size ()` now matches the code: without a test packet, the current size is kept, then capped at the MTU, or at the camera's smallest packet size if that is larger.
 
 ### GenTL
 
 - On Windows, producers load with `LoadLibraryExW` and `LOAD_WITH_ALTERED_SEARCH_PATH`: libraries installed next to a `.cti` file are found. A producer that fails to load gives a warning naming the file and the error.
 - Producers that lack functions Aravis never calls are accepted.
+- A device whose producer gives no serial number gets the Aravis id `<TL vendor>-<vendor>-<model>-<producer>-<interface id>-<device id>`: GenTL device ids are only unique within an interface, and a vendor may ship several producers. Devices with a serial number keep `<TL vendor>-<vendor>-<model>-<serial>`.
+- Single-part frames whose image starts at an offset (`BUFFER_INFO_IMAGEOFFSET`, after chunk data or a gap) are complete frames; the image part ends with the delivered data, and `aravissrc` sends the image alone.
 - Stream setup failures return `ARV_DEVICE_ERROR_STREAM_ERROR`, naming the GenTL function and the producer's error text, instead of being ignored.
 - Buffer status follows the producer: `ARV_BUFFER_STATUS_SIZE_MISMATCH`, `ARV_BUFFER_STATUS_MISSING_PACKETS`. Buffers flushed by a stop come back as ABORTED and are counted in the new `n_aborted` stream statistic.
 
@@ -144,6 +147,7 @@ Checked against `src/arvsystem.h`, `gst/gstaravis.c`, `gst/gstaravisdeviceprovid
 | Build | `-Dlibusb:windows-hotplug=true` | Builds the hotplug flavour of the wrap. Add meson's `--force-fallback-for=libusb-1.0` to use the wrap even when libusb is installed. |
 | Build | `-Dc_args=-DARV_UV_LIBUSB_STATIC` | Windows: calls the libusb 1.0.30 functions directly, for a static libusb that the build did not detect. |
 | Installed files | `share/aravis-0.10/winusb/` | `aravis-u3v.inf`, `aravis-u3v.cdf` and `arv-winusb-setup.ps1`, on Windows builds with USB. |
+| CI script option | `--source-url` of `.github/scripts/package-windows.py` | The repository the zip README links to, at the built revision; the workflows pass their own (`GITHUB_SERVER_URL/GITHUB_REPOSITORY`), the default is upstream. |
 | Script (not installed) | `scripts/arv-usb-benchmark.py` | The USB3 Vision throughput benchmark of item 20. |
 | Test environment | `ARV_TEST_LIBUSB_MIN_VERSION`, `ARV_TEST_LIBUSB_HOTPLUG` | Expectations of the `libusb-version` test, set by the Windows CI jobs. |
 | Test environment | `FAKEUV_TIME_SCALE`, `FAKE_USB_DEBUG`, `FAKEUV_DEBUG` | Time scale and logs of the fake libusb tests. |
@@ -205,6 +209,8 @@ Each item starts with the plan's title. Function names are the stable reference;
   - in sync mode, a final transfer padded to whole packets fails its frame;
   - on Linux in sync mode, a padded final transfer overflows;
   - in async mode, a buffer larger than the payload by one transfer loses the trailer.
+
+**Audit follow-up.** A stop whose RAW_IO disable failed (for example `LIBUSB_ERROR_NO_MEM`) used to leave the policy on silently: the next acquisition without RAW_IO then had every read rejected, with no frame and no error. The device now tracks the actual policy (`arv_uv_device_get_raw_io ()`), and a start without RAW_IO turns a policy left on back off, or fails. Tests: `/fakeuvrawio/failed-disable`, `failed-disable-sync`, `failed-disable-lasting`, `failed-disable-lasting-sync`.
 
 ### 2. The libusb version floor is too low for Windows
 
@@ -460,6 +466,11 @@ The failures that the plan reproduced against a mock producer, and their tests:
 - The cost of the per-producer mutex with real producers; `-Devent=true` was tested with the mock only.
 - The MSVC GStreamer CI job does not set `-Dgentl-producer=true`, so `/gentl/producer/*` skip there; no CI job builds `-Devent=true`.
 
+**Audit follow-up.**
+
+- The single-part fallback of `src/arvgentlstream.c` gave the image part the whole `BUFFER_INFO_DATA_SIZE` at offset `BUFFER_INFO_IMAGEOFFSET`, so a frame with a nonzero image offset that filled its buffer became `SIZE_MISMATCH`. The part now ends with the data: `DATA_SIZE - IMAGEOFFSET`. `aravissrc` sends that image part rather than the whole buffer, so the bytes before the image do not shift the frame. Tests: `/gentl/stream/image-offset` (mock option `ARV_GENTL_MOCK_IMAGE_OFFSET`, fallback and multi-part paths) and `test_gentl_image_offset`, which checks the content of the frames `aravissrc` sends.
+- The missing-serial fallback of `src/arvgentlinterface.c` used the GenTL device id alone, so devices of two interfaces, or of two producers of one vendor, could share an Aravis id: one camera could not be opened, and its entry opened the other. The fallback now adds the producer and the interface (`gentl.md`). Tests: `/gentl/discovery/missing-serial-number-interfaces`, `missing-serial-number-producers`, `interfaces-same-device-id` (mock option `ARV_GENTL_MOCK_N_INTERFACES`).
+
 ### 9. The GStreamer plugin is never built with MSVC upstream
 
 **Problem.** Both MSVC CI jobs disabled the plugin, so nothing checked that `aravissrc` builds and loads against the official GStreamer for Windows.
@@ -530,6 +541,8 @@ The failures that the plan reproduced against a mock producer, and their tests:
 
 - The `release-assets` jobs never ran, and no zip was tried on a clean machine.
 - The `msys2-ucrt64` zip was never produced: `package-windows.py` and the smoke test ran on an MSVC tree only.
+
+**Audit follow-up.** The zip README linked to `github.com/AravisProject/aravis` with the revision of whatever repository built it. `package-windows.py` takes `--source-url`, which both workflows set to their own repository. Test: `package-windows` (suite `packaging`), which builds zips for a fork, an Enterprise Server and upstream.
 
 ### 12. USB3 Vision code has no automated test
 
@@ -669,13 +682,13 @@ The failures that the plan reproduced against a mock producer, and their tests:
 - `GST_ARAVIS_DEVICE_PROVIDER=0` (or `off`, `false`, `no`), read at each probe, disables it.
 - Library support: `arv_get_device_interface_id ()`, and interned device-list strings that a concurrent list update cannot free.
 - A probe reads the whole device list between two equal readings of `arv_get_device_list_generation ()`, up to 10 times. So a `GstDevice` never mixes two cameras, and no camera is listed twice or left out for moving during the probe. A list that changes during all 10 reads gives no camera until the next probe.
-- Cameras that share an identifier (same vendor, model and serial) are listed once; the per-probe dedupe no longer keeps a freed key.
+- Cameras that share an identifier (same vendor, model and serial) on one interface are listed once; the per-probe dedupe no longer keeps a freed key. The dedupe key is the pair (interface, identifier) that `create_element` selects by: the same identifier on two interfaces, such as a USB3Vision and a GigEVision camera with the same vendor, model and serial, gives two devices.
 - `gst/pipelines.md` is now published as the "GStreamer Plugin" page; "Device monitor" covers the cost, the opt-out, the GenTL opt-in and Windows exclusivity.
 
 **Tests.**
 
 - `gstaravis` device-provider tcase (9 cases): `test_device_provider_factory`, `test_device_provider_probe`, `test_device_provider_enabled_interfaces`, `test_device_provider_create_element`, `test_device_provider_launch_line`, `test_device_provider_monitor`, `test_device_provider_concurrent_open`, `test_device_provider_concurrent_listing`, `test_device_provider_disabled`. Also `test_gentl_device_provider`.
-- `/fakeuvgst/provider-concurrent-update` (another thread changes the list at scripted device reads of a probe), `provider-while-streaming`, `provider-list-changes-twice`, `provider-duplicate-ids`.
+- `/fakeuvgst/provider-concurrent-update` (another thread changes the list at scripted device reads of a probe), `provider-while-streaming`, `provider-list-changes-twice`, `provider-duplicate-ids`. `/fakeuvgst/provider-same-id-two-interfaces` (a fake USB and a fake GigE camera both named `Aravis-Fake-1`) runs only in the `fakeuvgst-network` test of the `network` suite, as the fake GigE camera binds the fixed GigE Vision ports.
 - `/fake/device-list-generation` and `/fakeuvsystem/device-list-generation`: when the generation changes, and when it does not.
 - Before the review fixes, `gst-device-monitor-1.0 Video/Source` listed an `arv-fake-gv-camera` on 127.0.0.1, and its launch line played 20 buffers. This was not re-run after the review fixes.
 
@@ -782,7 +795,7 @@ The failures that the plan reproduced against a mock producer, and their tests:
 **What changed.**
 
 - `src/arvnetwork.c`: interface MTU from `SIOCGIFMTU` (Linux, macOS, BSD) or `IP_ADAPTER_ADDRESSES.Mtu` (Windows). Values outside 68 to 65535, such as loopback's, count as unknown (`arv_network_interface_get_mtu ()`).
-- `src/arvgvdevice.c`, `auto_packet_size ()`: the search is capped at the MTU and starts from it. Without a test packet, a larger stored size is lowered to the largest valid packet size not above the MTU. The search is `arv_gv_device_search_packet_size ()` (private, unit-tested).
+- `src/arvgvdevice.c`, `auto_packet_size ()`: the search is capped at the MTU and starts from it. Without a test packet, a larger stored size is lowered to the largest valid packet size not above the MTU. When the MTU is below the smallest valid packet size, that size is used, with a warning. The search is `arv_gv_device_search_packet_size ()` (private, unit-tested).
 - `src/arvgvstream.c`: the `n_leader_trailer_only_failures` statistic and its rate-limited warning. The last frame of an acquisition times out once its trailer arrives.
 - The fake GigE camera gains `gvsp-mtu` (`--gvsp-mtu`). The private hook `arv_network_set_loopback_mtu_override ()` lets tests give loopback an MTU.
 - `src/arvgvinterface.c`: discovery reaches a device through the interface whose subnet contains its address.
@@ -795,8 +808,8 @@ The failures that the plan reproduced against a mock producer, and their tests:
 
 **Tests.**
 
-- `gvpacketsize` (8 cases): the search, the MTU rules, interface MTU enumeration on this machine's real adapters.
-- `fakegvmtu` (suite `network`, 8 cases): `auto-packet-size`, `known-mtu`, `issue-1047`, `never-adjust`, the `leader-trailer-only` cases, `no-false-positive`. `issue-1047` streams complete frames from a camera stored at 8228 through a 1500-byte MTU.
+- `gvpacketsize` (9 cases): the search, the MTU rules, including an MTU below the smallest packet size (`mtu-below-minimum`), interface MTU enumeration on this machine's real adapters.
+- `fakegvmtu` (suite `network`, 9 cases): `auto-packet-size`, `known-mtu`, `issue-1047`, `never-adjust`, `mtu-below-minimum`, the `leader-trailer-only` cases, `no-false-positive`. `issue-1047` streams complete frames from a camera stored at 8228 through a 1500-byte MTU.
 - `gvsp`, `gvnetwork` and `fakegv` (7 cases, including `stream-channel` and `stream-channel-concurrent`).
 
 **Deviations from the plan.**
@@ -869,6 +882,19 @@ The failures that the plan reproduced against a mock producer, and their tests:
 | `gst/gstaravisdeviceprovider.c` | Per-probe dedupe kept a freed key: a camera seen three times read freed memory | Fixed | `/fakeuvgst/provider-list-changes-twice` | No: the provider is new here |
 | `src/arvdevice.c`, `arv_device_start_acquisition ()` | The stream's start error was dropped | The first one is put in the message | `/gentl/stream/start-failure` | Yes |
 | `src/arvsystem.c`, `arv_get_info ()` | The device-list queries returned the interface's string after releasing the lock: a concurrent update could free it | Strings interned (`g_intern_string ()`) | `/fake/device-list-strings`, `/fake/device-list-threads` | Yes |
+
+### From the audit of 9 October 2026
+
+An external audit of `8d517b7a` reported six findings, read from the source only (four at P2, two at P3 on its scale). Each was reproduced here with a compiled test that fails on `8d517b7a`, then fixed; the six fixes were reviewed together. The "Verified" column is the rating after reproduction.
+
+| Audit | Where | Defect | Fix | Test | Verified |
+| --- | --- | --- | --- | --- | --- |
+| 1 (P2) | `src/arvuvstream.c`, `src/arvuvdevice.c` | A failed RAW_IO disable at stop left the policy on; the next acquisition without RAW_IO got every read rejected, silently | The device tracks the actual policy; a start without RAW_IO turns it off first, or fails | `/fakeuvrawio/failed-disable*` | P3: needs a policy change to fail on a plugged camera, on the opt-in RAW_IO path |
+| 2 (P2) | `src/arvgentlstream.c` | A nonzero `BUFFER_INFO_IMAGEOFFSET` made complete single-part frames `SIZE_MISMATCH` | Image part size `DATA_SIZE - IMAGEOFFSET`; `aravissrc` sends the image part | `/gentl/stream/image-offset`, `test_gentl_image_offset` (frame content) | P2: every frame of such a producer is lost |
+| 3 (P2) | `src/arvgentlinterface.c` | Without serial numbers, devices of two interfaces or two producers shared an Aravis id: one could not be opened, and its entry opened the other | Producer and interface in the fallback id | `/gentl/discovery/missing-serial-number-interfaces`, `-producers`, `interfaces-same-device-id` | P2 |
+| 4 (P2) | `gst/gstaravisdeviceprovider.c` | The provider deduplicated by device id only, hiding a camera with the same id on another interface | Key on (interface, device id) | `/fakeuvgst/provider-same-id-two-interfaces` (`fakeuvgst-network`) | P3: needs the same vendor, model and serial on two transports |
+| 5 (P3) | `.github/scripts/package-windows.py`, workflows | Fork zips named upstream as their source | `--source-url` from the workflow | `package-windows` | P3 |
+| 6 (P3) | `src/arvgvdevice.c`, `src/arvcamera.c`, docs | "Never exceeds the MTU" was false when the camera's smallest packet size is larger, and the log said the size fit | Corrected wording in every place, truthful info line, a warning when no size fits | `/gvpacketsize/mtu-below-minimum`, `/fakegvmtu/mtu-below-minimum` | P3 |
 
 ## Build, CI and packaging
 
@@ -1026,7 +1052,7 @@ Machine: Windows 11 Pro 10.0.26200, MSVC 19.51 (Visual Studio 18.9.1), meson 1.1
 
 | Configuration | Result |
 | --- | --- |
-| MSVC debug (`/MDd`), shared, release GLib of the kit | 31/31 tests, network 3/3 |
+| MSVC debug (`/MDd`), shared, release GLib of the kit | 32/32 tests, network 4/4 with the audit fixes (31/31 and 3/3 before) |
 | MSVC release | 31/31, network 3/3 |
 | `-Ddefault_library=both` | DLL, import library and static library built; 31/31, network 3/3 |
 | `-Ddefault_library=static` | 29/29 (static builds define no `gst` or `gentl` tests) |
@@ -1154,6 +1180,10 @@ The setup comes first. Each other entry is a Done-when of the plan that could no
 **Known problems.**
 
 - The workflows' time limits have not been checked on hosted runners.
+- GigE: the MTU check runs before the camera reads back the packet size it accepted. A camera that rounds a written size up can end above the MTU without the warning.
+- USB: the RAW_IO record starts as "off" when a device opens. libusb claims the stream interface through `WinUsb_GetAssociatedInterface`, and Microsoft documents the policy reset only for `WinUsb_Initialize`. If WinUSB keeps RAW_IO on across a close, the first acquisition without RAW_IO after a reopen would get no frames. This needs a camera to settle.
+- The device provider now lists a camera id found on two interfaces twice, with identical display names; only `aravis.interface` and `aravis.protocol` differ.
+- `/gentl/discovery/missing-serial-number-producers` loads a producer copied into the system temp folder, so it fails where that folder is mounted `noexec`.
 - With GLib 2.82 on Windows, a process that loads GIO sometimes loses its unflushed stdout at exit, in about 5% of runs. `arv-camera-test` can lose its final stream statistics that way.
 - In MSVC debug (`/MDd`) builds, only `tests/debug.c` turns off the C runtime's dialogs. Another test that fails inside the debug C runtime may wait on a dialog until meson's timeout. Seen once: a deliberately failing `uvlibusb` with `ARV_DEBUG` in the static `/MDd` build; the cause was not investigated.
 
@@ -1176,7 +1206,7 @@ The setup comes first. Each other entry is a Done-when of the plan that could no
 
 **Before upstreaming.**
 
-- This branch holds the work as one commit, made for this fork. For upstream, split it into pull requests by area (see the last point), with messages that describe each change rather than the plan's item numbers.
+- This branch holds the work as two commits, made for this fork: the implementation and the audit fixes. For upstream, split it into pull requests by area (see the last point), with messages that describe each change rather than the plan's item numbers.
 - Leave out the fork-only commits `6409832b` (`design/` in `.gitignore`) and `ef8ac13d` (an empty `changed4win.md`), and this file.
 - Put the protocol-code statement above in the pull requests that touch `src/arvuv*.[ch]` or `src/arvgv*.[ch]`.
 - Several files link to upstream pages that lack the new sections until upstream merges and republishes its documentation:

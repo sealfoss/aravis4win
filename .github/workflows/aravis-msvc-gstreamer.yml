@@ -105,8 +105,8 @@ jobs:
         meson install -C build --no-rebuild --destdir "$env:RUNNER_TEMP\stage"
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         python .github/scripts/package-windows.py --builddir build --destdir "$env:RUNNER_TEMP\stage" `
-          --flavour msvc-x86_64 --revision $env:GITHUB_SHA ${{ github.event_name == 'release' && '--release' || '' }} `
-          --output-dir dist
+          --flavour msvc-x86_64 --revision $env:GITHUB_SHA --source-url "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY" `
+          ${{ github.event_name == 'release' && '--release' || '' }} --output-dir dist
 
     - name: smoke test
       run: |

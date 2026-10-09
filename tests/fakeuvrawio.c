@@ -1784,6 +1784,233 @@ gendc_failed_test (void)
 	g_clear_object (&camera);
 }
 
+/* RAW_IO that the stop of an acquisition fails to turn off, the camera still there: libusb_endpoint_set_raw_io () gives
+ * LIBUSB_ERROR_NO_MEM when WinUSB's SetPipePolicy () fails with ERROR_NOT_ENOUGH_MEMORY (libusb 1.0.30,
+ * winusbx_endpoint_set_raw_io ()), and the fake, as WinUSB, changes nothing then. The policy belongs to the claimed
+ * interface, which the device keeps: a later acquisition of the same device without RAW_IO (ARV_UV_RAW_IO=0, or sync
+ * mode) reads its leaders, trailers and payload ends in reads that are not whole packets, which RAW_IO rejects, while
+ * the device checks succeed. That acquisition turns RAW_IO off before its first read, and fails to start, without
+ * reading, if it cannot. */
+
+typedef struct {
+	gboolean started;
+	GError *start_error;
+	guint n_good;			/* frames received, each one the frame the camera sent */
+	guint n_other;			/* buffers back that are not */
+	guint64 n_rejected;		/* reads RAW_IO rejected */
+	gboolean stopped;
+	gint64 stop_time_ms;
+	gboolean raw_io_after;		/* RAW_IO on after the stop */
+} BoundedAcquisition;
+
+/* Starts an acquisition, takes @n_frames good frames within TIMEOUT_MS, then stops it and releases the stream, whatever
+ * came: the checks come after, so that a failure leaves no stream thread behind. */
+
+static void
+_acquire_bounded (ArvCamera *camera, FakeUsbDevice *device, ArvUvUsbMode usb_mode, guint n_frames,
+		  BoundedAcquisition *result)
+{
+	ArvStream *stream;
+	GError *error = NULL;
+	guint64 n_rejected = fake_usb_device_get_stat (device, FAKE_USB_STAT_RAW_IO_REJECTED_TRANSFERS);
+	gint64 end_time;
+	gint64 stop_start;
+
+	memset (result, 0, sizeof (*result));
+
+	stream = _create_stream (camera, device, usb_mode, NULL, NULL);
+
+	result->started = arv_camera_start_acquisition (camera, &result->start_error);
+	if (result->started) {
+		end_time = g_get_monotonic_time () + (gint64) fakeuv_timeout_ms (TIMEOUT_MS) * G_TIME_SPAN_MILLISECOND;
+		while (result->n_good < n_frames && g_get_monotonic_time () < end_time) {
+			ArvBuffer *buffer = arv_stream_timeout_pop_buffer (stream, 10000);
+
+			if (buffer == NULL)
+				continue;
+
+			if (arv_buffer_get_status (buffer) == ARV_BUFFER_STATUS_SUCCESS &&
+			    fakeuv_buffer_matches_frame (device, buffer))
+				result->n_good++;
+			else
+				result->n_other++;
+			arv_stream_push_buffer (stream, buffer);
+		}
+
+		stop_start = g_get_monotonic_time ();
+		result->stopped = arv_camera_stop_acquisition (camera, &error);
+		result->stop_time_ms = (g_get_monotonic_time () - stop_start) / G_TIME_SPAN_MILLISECOND;
+		g_clear_error (&error);
+	}
+
+	g_object_unref (stream);
+
+	result->n_rejected = fake_usb_device_get_stat (device, FAKE_USB_STAT_RAW_IO_REJECTED_TRANSFERS) - n_rejected;
+	result->raw_io_after = fake_usb_device_get_raw_io (device, FAKE_USB_CAMERA_DATA_ENDPOINT_IN);
+
+	if (g_test_verbose ())
+		g_printerr ("%s: started %d (%s), %u good, %u other, %" G_GUINT64_FORMAT " rejected reads, stopped %d "
+			    "in %" G_GINT64_FORMAT " ms, RAW_IO %s after\n",
+			    usb_mode == ARV_UV_USB_MODE_ASYNC ? "async" : "sync", result->started,
+			    result->start_error != NULL ? result->start_error->message : "no error",
+			    result->n_good, result->n_other, result->n_rejected, result->stopped, result->stop_time_ms,
+			    result->raw_io_after ? "on" : "off");
+}
+
+/* Marks the case as failed without aborting it, like g_test_fail_printf (), which needs GLib 2.70 */
+
+static void _fail_printf (const char *format, ...) G_GNUC_PRINTF (1, 2);
+
+static void
+_fail_printf (const char *format, ...)
+{
+	va_list args;
+	char *message;
+
+	va_start (args, format);
+	message = g_strdup_vprintf (format, args);
+	va_end (args);
+
+	g_test_message ("%s", message);
+	g_free (message);
+	g_test_fail ();
+}
+
+/* Fails the case without aborting it, so that the camera is closed and the next cases run */
+
+static void
+_expect_frames (const BoundedAcquisition *acquisition, guint n_frames, const char *what)
+{
+	if (!acquisition->started)
+		_fail_printf ("%s: failed to start (%s)", what,
+				    acquisition->start_error != NULL ? acquisition->start_error->message : "no error");
+	else if (acquisition->n_good < n_frames)
+		_fail_printf ("%s: %u good frames of %u, %u other buffers, %" G_GUINT64_FORMAT " reads rejected "
+				    "by RAW_IO", what, acquisition->n_good, n_frames, acquisition->n_other,
+				    acquisition->n_rejected);
+	else if (acquisition->n_rejected != 0)
+		_fail_printf ("%s: %" G_GUINT64_FORMAT " reads rejected by RAW_IO", what, acquisition->n_rejected);
+	else if (!acquisition->stopped)
+		_fail_printf ("%s: failed to stop", what);
+	else if (acquisition->raw_io_after)
+		_fail_printf ("%s: RAW_IO still on after the stop", what);
+}
+
+static void
+failed_disable (ArvUvUsbMode restart_mode, guint n_failures)
+{
+	BoundedAcquisition acquisition;
+	FakeUsbDevice *device;
+	ArvCamera *camera;
+	ArvStream *stream;
+	GError *error = NULL;
+	gint n_control_lost = 0;
+	guint64 n_set_raw_io;
+
+	if (!RAW_IO_AVAILABLE) {
+		g_test_skip ("RAW_IO needs libusb 1.0.30 headers");
+		return;
+	}
+
+	device = _add_camera (FAKE_USB_PLATFORM_WINDOWS, 720, 540);
+	camera = _open_camera (device);
+	g_signal_connect (arv_camera_get_device (camera), "control-lost", G_CALLBACK (_control_lost_cb),
+			  &n_control_lost);
+
+	/* An acquisition with RAW_IO, which stops while libusb fails to turn it off @n_failures times */
+	stream = _create_stream (camera, device, ARV_UV_USB_MODE_ASYNC, NULL, NULL);
+	arv_camera_start_acquisition (camera, &error);
+	g_assert_no_error (error);
+	g_assert_true (fake_usb_device_get_raw_io (device, FAKE_USB_CAMERA_DATA_ENDPOINT_IN));
+	_receive_good_frames (stream, device, N_FRAMES);
+
+	n_set_raw_io = fake_usb_device_get_call_count (device, FAKE_USB_CALL_ENDPOINT_SET_RAW_IO);
+	fake_usb_device_inject_error (device, FAKE_USB_CALL_ENDPOINT_SET_RAW_IO, FAKE_USB_CAMERA_DATA_ENDPOINT_IN,
+				      LIBUSB_ERROR_NO_MEM, n_failures);
+	g_assert_true (arv_camera_stop_acquisition (camera, &error));
+	g_assert_no_error (error);
+	g_object_unref (stream);
+
+	/* Tried once, failed: RAW_IO is still on, the camera still there */
+	g_assert_cmpuint (fake_usb_device_get_call_count (device, FAKE_USB_CALL_ENDPOINT_SET_RAW_IO), ==,
+			  n_set_raw_io + 1);
+	g_assert_true (fake_usb_device_get_raw_io (device, FAKE_USB_CAMERA_DATA_ENDPOINT_IN));
+	g_assert_true (fake_usb_device_is_plugged (device));
+
+	/* The same device, without RAW_IO */
+	if (restart_mode == ARV_UV_USB_MODE_ASYNC)
+		g_setenv ("ARV_UV_RAW_IO", "0", TRUE);
+
+	if (n_failures > 1) {
+		/* Still failing: the start fails, at once, without a read */
+		_acquire_bounded (camera, device, restart_mode, N_FRAMES, &acquisition);
+		if (acquisition.started) {
+			_fail_printf ("Started with RAW_IO stuck on: %u good frames, %" G_GUINT64_FORMAT " reads "
+					    "rejected by RAW_IO", acquisition.n_good, acquisition.n_rejected);
+		} else {
+			if (!g_error_matches (acquisition.start_error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_STREAM_ERROR) ||
+			    strstr (acquisition.start_error->message, "RAW_IO") == NULL)
+				_fail_printf ("Unexpected start error: %s", acquisition.start_error != NULL ?
+						    acquisition.start_error->message : "none");
+			g_assert_cmpuint (acquisition.n_rejected, ==, 0);
+			g_assert_true (acquisition.raw_io_after);
+			g_assert_false (fake_usb_camera_is_streaming (device));
+		}
+		g_clear_error (&acquisition.start_error);
+	}
+
+	/* RAW_IO turned off before the first read: frames as usual */
+	if (!g_test_failed ()) {
+		_acquire_bounded (camera, device, restart_mode, N_FRAMES, &acquisition);
+		_expect_frames (&acquisition, N_FRAMES, restart_mode == ARV_UV_USB_MODE_ASYNC ?
+				"Async restart without RAW_IO" : "Sync restart");
+		g_clear_error (&acquisition.start_error);
+	}
+
+	/* Then as before: without RAW_IO, no RAW_IO call at all, and with it, on and off again */
+	if (!g_test_failed ()) {
+		Acquisition again = {0};
+
+		_acquire (camera, device, restart_mode, N_FRAMES, &again);
+		g_assert_false (again.raw_io_seen);
+		g_assert_cmpuint (again.n_set_raw_io, ==, 0);
+
+		g_setenv ("ARV_UV_RAW_IO", "1", TRUE);
+		_acquire (camera, device, ARV_UV_USB_MODE_ASYNC, N_FRAMES, &again);
+		g_assert_true (again.raw_io_seen);
+		g_assert_cmpuint (again.n_set_raw_io, ==, 2);
+	}
+
+	/* Never taken for a removal */
+	g_assert_cmpint (g_atomic_int_get (&n_control_lost), ==, 0);
+
+	g_clear_object (&camera);
+}
+
+static void
+failed_disable_test (void)
+{
+	failed_disable (ARV_UV_USB_MODE_ASYNC, 1);
+}
+
+static void
+failed_disable_sync_test (void)
+{
+	failed_disable (ARV_UV_USB_MODE_SYNC, 1);
+}
+
+static void
+failed_disable_lasting_test (void)
+{
+	failed_disable (ARV_UV_USB_MODE_ASYNC, 2);
+}
+
+static void
+failed_disable_lasting_sync_test (void)
+{
+	failed_disable (ARV_UV_USB_MODE_SYNC, 2);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -1827,6 +2054,10 @@ main (int argc, char *argv[])
 	fakeuv_test_add ("/fakeuvrawio/gendc-failed", gendc_failed_test);
 	fakeuv_test_add ("/fakeuvrawio/unplug", unplug_test);
 	fakeuv_test_add ("/fakeuvrawio/pending-transfers", pending_transfers_test);
+	fakeuv_test_add ("/fakeuvrawio/failed-disable", failed_disable_test);
+	fakeuv_test_add ("/fakeuvrawio/failed-disable-sync", failed_disable_sync_test);
+	fakeuv_test_add ("/fakeuvrawio/failed-disable-lasting", failed_disable_lasting_test);
+	fakeuv_test_add ("/fakeuvrawio/failed-disable-lasting-sync", failed_disable_lasting_sync_test);
 
 	return fakeuv_test_run ();
 }

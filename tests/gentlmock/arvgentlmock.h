@@ -4,7 +4,7 @@
  * Mock GenTL producer for the GenTL consumer tests ('gentl' suite).
  *
  * The producer implements the GenTL C API as src/arvgentlprivate.h declares it. It exposes one system, one interface
- * (ARV_GENTL_MOCK_INTERFACE_ID), ARV_GENTL_MOCK_N_DEVICES devices (one by default) named
+ * by default (ARV_GENTL_MOCK_INTERFACE_ID), ARV_GENTL_MOCK_N_DEVICES devices per interface (one by default) named
  * ARV_GENTL_MOCK_GENTL_DEVICE_ID<n>, and one data stream per device. Each remote device is an ArvFakeCamera: its
  * registers are reached through GCReadPort and GCWritePort, and its fill pattern generates the frames, at the frame
  * rate of the fake camera.
@@ -23,7 +23,11 @@
  * Its behaviour is scripted with the following options, read from the environment by GCInitLib, or changed by
  * arv_gentl_mock_set_option() once the producer is initialized (GCInitLib resets them):
  *
- *   ARV_GENTL_MOCK_N_DEVICES         number of devices, 0 to 8 (environment only)
+ *   ARV_GENTL_MOCK_N_DEVICES         number of devices, 0 to 8 (environment only), on each interface
+ *   ARV_GENTL_MOCK_N_INTERFACES      number of interfaces, 1 to 4 (environment only). Interface <k> is
+ *                                    ARV_GENTL_MOCK_INTERFACE_ID_PREFIX<k>; its devices have the same GenTL device
+ *                                    ids as the devices of the other interfaces, and, beyond the first interface,
+ *                                    the serial number ARV_GENTL_MOCK_SERIAL<n>-IF<k>, also in their fake camera
  *   ARV_GENTL_MOCK_MISSING_INFO      comma separated list of TL_INFO_xxx, INTERFACE_INFO_xxx and DEVICE_INFO_xxx
  *                                    commands, for which the info functions fail with GC_ERR_NOT_AVAILABLE
  *   ARV_GENTL_MOCK_EMPTY_INFO        same, for string commands returning an empty string
@@ -51,6 +55,12 @@
  *                                    size (BUFFER_INFO_DATA_SIZE, and BUFFER_PART_INFO_DATA_SIZE) larger than their
  *                                    buffer by this many bytes, without BUFFER_INFO_DATA_LARGER_THAN_BUFFER (0,
  *                                    default: the actual sizes)
+ *   ARV_GENTL_MOCK_IMAGE_OFFSET      the data of each frame starts with this many bytes (at most
+ *                                    ARV_GENTL_MOCK_IMAGE_OFFSET_MAX) of other data, like chunk data, filled with
+ *                                    ARV_GENTL_MOCK_IMAGE_OFFSET_FILL, followed by the image: BUFFER_INFO_IMAGEOFFSET
+ *                                    tells this offset, the data sizes (BUFFER_INFO_SIZE_FILLED, BUFFER_INFO_DATA_SIZE)
+ *                                    count these bytes, and the image part of the multi-part functions
+ *                                    (BUFFER_PART_INFO_BASE, BUFFER_PART_INFO_DATA_SIZE) starts after them (0, default)
  *
  * The control functions below are exported by the producer, and reached through GModule:
  *
@@ -89,11 +99,16 @@ G_BEGIN_DECLS
 #define ARV_GENTL_MOCK_MODEL			"MockCamera"
 #define ARV_GENTL_MOCK_SERIAL			"MOCK"
 #define ARV_GENTL_MOCK_TL_TYPE			"Custom"
-#define ARV_GENTL_MOCK_INTERFACE_ID		"MockInterface0"
+#define ARV_GENTL_MOCK_INTERFACE_ID_PREFIX	"MockInterface"
+#define ARV_GENTL_MOCK_INTERFACE_ID		ARV_GENTL_MOCK_INTERFACE_ID_PREFIX "0"
 #define ARV_GENTL_MOCK_GENTL_DEVICE_ID		"MockDevice"
 #define ARV_GENTL_MOCK_STREAM_ID		"MockStream0"
 
 #define ARV_GENTL_MOCK_MAX_DEVICES		8
+#define ARV_GENTL_MOCK_MAX_INTERFACES		4
+
+#define ARV_GENTL_MOCK_IMAGE_OFFSET_MAX		65536
+#define ARV_GENTL_MOCK_IMAGE_OFFSET_FILL	0xa5
 
 #define ARV_GENTL_MOCK_GET_COUNTER		"arv_gentl_mock_get_counter"
 #define ARV_GENTL_MOCK_GET_LAST_VIOLATION	"arv_gentl_mock_get_last_violation"
