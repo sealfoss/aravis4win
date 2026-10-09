@@ -8,7 +8,12 @@ on:
     branches: [ main, aravis-0-8 ]
   pull_request:
     branches: [ main, aravis-0-8 ]
+  release:
+    types: [ published ]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   mingw:
@@ -17,9 +22,12 @@ jobs:
       fail-fast: false # see all failures, not just the first one
       matrix:
         include:
-          - { sys: mingw64, env: x86_64 }
+          # MSYS2's libusb (1.0.30, without hotplug support)
+          - { sys: mingw64, env: x86_64, buildtype: plain }
           # - { sys: mingw32, env: i686 } # mingw32 is missing gst-plugins-good package, disabled for now
-          - { sys: ucrt64,  env: ucrt-x86_64 }
+          # libusb 1.0.30 from subprojects/libusb.wrap with Windows hotplug support, packaged as a zip
+          - { sys: ucrt64,  env: ucrt-x86_64, buildtype: release, package: true,
+              meson-args: '--force-fallback-for=libusb-1.0 -Dlibusb:windows-hotplug=true' }
           # - { sys: clang64, env: clang-x86_64 } # clang64 is missing several packages, disabled for now
     defaults:
       run:
@@ -45,19 +53,70 @@ jobs:
           mingw-w64-${{matrix.env}}-libusb
           mingw-w64-${{matrix.env}}-gobject-introspection-runtime
           mingw-w64-${{matrix.env}}-python-gobject
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v5
     - name: meson
       run: |
         mkdir build
-        meson setup --buildtype=plain -Ddocumentation=disabled -Dgst-plugin=enabled -Dintrospection=enabled -Dusb=enabled -Dviewer=enabled -Dgv-n-buffers=1 -Dgentl-producer=true . ./build
+        meson setup --buildtype=${{matrix.buildtype}} -Ddocumentation=disabled -Dgst-plugin=enabled -Dintrospection=enabled -Dusb=enabled -Dviewer=enabled -Dgentl-producer=true ${{matrix.meson-args}} . ./build
+    - name: ninja
+      run: |
+        ninja -C ./build --verbose
+    - name: package
+      if: matrix.package
+      run: |
+        set -e
+        meson install -C ./build --no-rebuild --destdir "$(cygpath -m "$PWD/stage")"
+        python .github/scripts/package-windows.py --builddir build --destdir stage \
+          --flavour msys2-${{matrix.sys}} --revision "$GITHUB_SHA" ${{ github.event_name == 'release' && '--release' || '' }} \
+          --output-dir dist
+    - name: smoke test
+      if: matrix.package
+      run: |
+        # The unzipped package, before Aravis is installed into the MSYS2 prefix
+        set -e
+        python -c "import glob, sys, zipfile; zipfile.ZipFile(glob.glob('dist/*.zip')[0]).extractall(sys.argv[1])" unzipped
+        python .github/scripts/smoke-test-gstreamer.py --prefix "$(ls -d unzipped/aravis-*)"
+    - name: test configuration
+      # The tests run with -Dgv-n-buffers=1, as in every Windows CI job since
+      # commit b4211e5e, once the zip, built with the default, is made
+      run: |
+        meson configure ./build -Dgv-n-buffers=1
     - name: ninja install
       run: |
         ninja -C ./build --verbose install
     - name: meson test
+      env:
+        # tests/libusbversion.c: every Windows job links libusb 1.0.30 or later
+        ARV_TEST_LIBUSB_MIN_VERSION: 1.0.30
+        ARV_TEST_LIBUSB_HOTPLUG: ${{ matrix.package && '1' || '' }}
       run: |
         meson test -C ./build
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v6
+      if: matrix.package
+      with:
+        name: aravis-msys2-${{matrix.sys}}
+        path: dist/*
+        if-no-files-found: error
+    - uses: actions/upload-artifact@v6
       if: failure()
       with:
         name: ${{matrix.sys}}_Meson_Testlog
         path: build/meson-logs/testlog.txt
+
+  release-assets:
+    if: github.event_name == 'release'
+    needs: mingw
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v7
+      with:
+        pattern: aravis-msys2-*
+        merge-multiple: true
+        path: dist
+    - name: attach to release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name }}
+      run: gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"

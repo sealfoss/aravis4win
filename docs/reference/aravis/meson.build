@@ -17,10 +17,13 @@ expand_content_md_files = [
   'utilities.md',
   'ethernet.md',
   'usb.md',
+  'gentl.md',
   'thread-safety.md',
   'porting-0.10.md',
   'porting-0.8.md',
-  'tests.md'
+  'tests.md',
+  # The page of the GStreamer plugin, kept with its sources
+  meson.project_source_root() / 'gst' / 'pipelines.md'
 ]
 
 aravis_toml=configure_file(
@@ -43,6 +46,7 @@ custom_target(
     '--config=@INPUT0@',
     '--output-dir=@OUTPUT@',
     '--content-dir=@0@'.format(meson.current_source_dir()),
+    '--content-dir=@0@'.format(meson.project_source_root() / 'gst'),
     '@INPUT1@'
     ],
     depend_files: [ expand_content_md_files ],

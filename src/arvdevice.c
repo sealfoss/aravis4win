@@ -1433,6 +1433,7 @@ arv_device_start_acquisition (ArvDevice *device, GError **error)
 {
         ArvDevicePrivate *priv = arv_device_get_instance_private (device);
         GSList *iter = priv->streams;
+        GError *stream_error = NULL;
         gboolean success = TRUE;
 
         g_return_val_if_fail (ARV_IS_DEVICE(device), FALSE);
@@ -1451,9 +1452,16 @@ arv_device_start_acquisition (ArvDevice *device, GError **error)
                 iter = g_slist_next(iter);
 
                 if (stream) {
-                        if (!arv_stream_start_acquisition (stream, NULL)) {
+                        GError *local_error = NULL;
+
+                        if (!arv_stream_start_acquisition (stream, &local_error)) {
                                 success = FALSE;
                         }
+                        /* The reason of the first failure is given to the caller */
+                        if (local_error != NULL && stream_error == NULL)
+                                stream_error = local_error;
+                        else
+                                g_clear_error (&local_error);
                         g_object_unref(stream);
                 } else {
                         priv->streams = g_slist_remove(priv->streams, stream_weak_ref);
@@ -1464,7 +1472,11 @@ arv_device_start_acquisition (ArvDevice *device, GError **error)
 
         if (!success)
                 g_set_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_STREAM_ERROR,
-                             "Failed to start one of the device streams");
+                             "Failed to start one of the device streams%s%s",
+                             stream_error != NULL ? ": " : "",
+                             stream_error != NULL ? stream_error->message : "");
+
+        g_clear_error (&stream_error);
 
         return success;
 }

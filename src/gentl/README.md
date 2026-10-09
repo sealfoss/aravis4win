@@ -1,7 +1,8 @@
 # GenTL producer
 
-Function signatures are defined by EMVA; the header `GenTL_v1_6.h` is included
-as distributed by EMVA (BSD-license + prohibition of modification).
+Function signatures are defined by EMVA; they are declared by
+`src/arvgentlprivate.h`, written from the API documentation, which the GenTL
+consumer of Aravis shares. `TODO.md` lists what is not implemented.
 
 Implementation of those functions is split into modules indicated by function
 prefixes:

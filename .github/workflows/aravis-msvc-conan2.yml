@@ -29,7 +29,10 @@ jobs:
       run: |
         rm -r C:\Strawberry\perl
     - name: checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v5
+    # libusb is not taken from ConanCenter, whose newest libusb (1.0.29) lacks
+    # the WinUSB RAW_IO functions of 1.0.30: with no libusb-1.0.pc from Conan,
+    # meson builds libusb 1.0.30 from subprojects/libusb.wrap.
     - name: conan
       env:
         INPUT_CONANFILE: |
@@ -37,7 +40,6 @@ jobs:
           glib/2.86.5
           libxml2/2.15.4
           zlib/1.3.2
-          libusb/1.0.29
 
           [tool_requires]
           meson/1.10.2
@@ -83,12 +85,15 @@ jobs:
         meson install -C .\build
         echo "::endgroup::"
     - name: test
+      env:
+        # tests/libusbversion.c: every Windows job links libusb 1.0.30 or later
+        ARV_TEST_LIBUSB_MIN_VERSION: 1.0.30
       run: |
         .\build\conanbuild.ps1
         .\build\conanrun.ps1
         meson test -C .\build
     - name: logs
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       if: failure()
       with:
         name: msvc_${{ matrix.version }}_${{ matrix.arch }}_${{ matrix.build_type_meson }}_Meson_Testlog

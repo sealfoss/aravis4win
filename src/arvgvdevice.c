@@ -96,6 +96,10 @@ typedef struct {
 
 	gboolean first_stream_created;
 
+	/* Stream channel -> the stream which configured it last, only compared, never dereferenced */
+	GMutex stream_channels_mutex;
+	GHashTable *stream_channel_owners;
+
 	gboolean init_success;
 } ArvGvDevicePrivate ;
 
@@ -647,11 +651,218 @@ test_packet_check (ArvDevice *device,
 	return n_events != 0;
 }
 
+/*
+ * arv_gv_device_search_packet_size:
+ * @packet_size: current packet size
+ * @min_size: smallest packet size to try
+ * @max_size: largest packet size to try
+ * @inc: packet size increment
+ * @mtu: MTU of the host interface the device is reached through, 0 if unknown
+ * @exit_early: keep @packet_size if a test packet of this size reaches the host
+ * @test_func: (nullable): packet size test function, %NULL if the device can't fire test packets
+ * @test_data: data passed to @test_func
+ * @error: a #GError placeholder, %NULL to ignore
+ *
+ * Aravis packet sizes count the whole IP datagram, so the largest packet that can leave the host interface without
+ * being fragmented is as large as its MTU. Test packets can't tell: the host may reassemble fragmented test packets,
+ * and some network adapters accept oversized frames. When the MTU is known, a larger @packet_size is lowered to the
+ * largest size of the search grid fitting in the MTU, even without test function, and if the MTU is smaller than
+ * @max_size, it caps the search, which starts from the cap. Without a known MTU, the search is unchanged.
+ *
+ * Returns: the packet size to use.
+ */
+
+guint
+arv_gv_device_search_packet_size (guint packet_size,
+				  guint min_size, guint max_size, guint inc,
+				  guint mtu, gboolean exit_early,
+				  ArvGvDevicePacketSizeTest test_func, void *test_data,
+				  GError **error)
+{
+	GError *local_error = NULL;
+	gboolean is_mtu_bound = FALSE;
+	gboolean success;
+	guint current_size;
+	guint last_size = 0;
+
+	if (inc < 1)
+		inc = 1;
+
+	if (mtu > 0) {
+		guint cap;
+
+		/* Largest packet size of the search grid fitting in the MTU */
+		cap = MIN (mtu, max_size);
+		cap = cap > min_size ? min_size + ((cap - min_size) / inc) * inc : min_size;
+
+		if (mtu < max_size) {
+			max_size = cap;
+			is_mtu_bound = TRUE;
+		}
+
+		if (packet_size > mtu && packet_size > cap) {
+			arv_info_device ("[GvDevice::auto_packet_size] Packet size lowered from %u to %u bytes, "
+					 "to fit in the interface MTU (%u bytes)", packet_size, cap, mtu);
+			packet_size = cap;
+		}
+	}
+
+	if (test_func == NULL)
+		return packet_size;
+
+	if (exit_early) {
+		current_size = packet_size;
+		success = test_func (&current_size, test_data, &local_error);
+		if (local_error != NULL) {
+			g_propagate_error (error, local_error);
+			return packet_size;
+		}
+
+		if (success) {
+			arv_info_device ("[GvDevice::auto_packet_size] Current packet size check successfull (%u bytes)",
+					 current_size);
+			return current_size;
+		}
+	}
+
+	/* The MTU is the most likely working packet size. Otherwise, start from the current one. */
+	current_size = is_mtu_bound ? max_size : packet_size;
+
+	do {
+		if (current_size == last_size ||
+		    min_size + inc > max_size)
+			break;
+
+		last_size = current_size;
+
+		success = test_func (&current_size, test_data, &local_error);
+		if (local_error != NULL)
+			break;
+
+		arv_info_device ("[GvDevice::auto_packet_size] Try packet size = %u (%u - min: %u - max: %u - inc: %u): %s",
+				 current_size, last_size, min_size, max_size, inc, success ? "success" : "failure");
+
+		if (success) {
+			packet_size = current_size;
+			if (current_size == max_size)
+				break;
+
+			min_size = current_size;
+		} else {
+			max_size = current_size;
+		}
+
+		current_size = min_size + (((max_size - min_size) / 2) / inc) * inc;
+	} while (TRUE);
+
+	if (local_error != NULL)
+		g_propagate_error (error, local_error);
+
+	return packet_size;
+}
+
+typedef struct {
+	ArvDevice *device;
+	GSocket *socket;
+	GPollFD *poll_fd;
+	char *buffer;
+	guint buffer_size;
+	guint packet_size;	/* Packet size currently set in the device */
+} ArvGvDeviceTestPacketData;
+
+static gboolean
+_test_packet_size (guint *packet_size, void *user_data, GError **error)
+{
+	ArvGvDeviceTestPacketData *data = user_data;
+
+	if (*packet_size != data->packet_size) {
+		GError *local_error = NULL;
+		guint actual_size;
+
+		arv_device_set_integer_feature_value (data->device, "ArvGevSCPSPacketSize", *packet_size, NULL);
+
+		actual_size = arv_device_get_integer_feature_value (data->device, "ArvGevSCPSPacketSize", &local_error);
+		if (local_error != NULL) {
+			g_propagate_error (error, local_error);
+			return FALSE;
+		}
+
+		data->packet_size = actual_size;
+		*packet_size = actual_size;
+	}
+
+	return test_packet_check (data->device, data->poll_fd, data->socket,
+				  data->buffer, data->buffer_size, *packet_size);
+}
+
+static gboolean
+_get_packet_size_bounds (ArvDevice *device, guint *min_size, guint *max_size, guint *inc)
+{
+	gint64 minimum, maximum;
+
+        /* PacketSize boundaries registers are device specific. Use the standard feature name for finding boundaries. If
+         * this feature is not present in the device Genicam data, it will fallback to the default definition inserted
+         * in arv_gv_device_load_genicam */
+	arv_device_get_integer_feature_bounds (device, "GevSCPSPacketSize", &minimum, &maximum, NULL);
+	*inc = arv_device_get_integer_feature_increment (device, "GevSCPSPacketSize", NULL);
+	if (*inc < 1)
+		*inc = 1;
+
+	*max_size = MIN (ARV_GVSP_MAXIMUM_PACKET_SIZE, maximum);
+	*min_size = MAX (ARV_GVSP_MINIMUM_PACKET_SIZE, minimum);
+
+	if (*max_size < *min_size ||
+	    *inc > *max_size - *min_size) {
+		arv_warning_device ("[GvDevice::auto_packet_size] Invalid ArvGevSCPSPacketSize properties");
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+/* Without test packet, the only adjustment is lowering a packet size larger than the MTU of the host interface */
+
+static guint
+_lower_packet_size_to_mtu (ArvGvDevice *gv_device, guint mtu, GError **error)
+{
+	ArvDevice *device = ARV_DEVICE (gv_device);
+	GError *local_error = NULL;
+	guint packet_size;
+	guint new_packet_size;
+	guint min_size, max_size, inc;
+
+	packet_size = arv_device_get_integer_feature_value (device, "ArvGevSCPSPacketSize", &local_error);
+	if (local_error != NULL) {
+		g_propagate_error (error, local_error);
+		return packet_size;
+	}
+
+	if (mtu == 0 ||
+	    !_get_packet_size_bounds (device, &min_size, &max_size, &inc))
+		return packet_size;
+
+	new_packet_size = arv_gv_device_search_packet_size (packet_size, min_size, max_size, inc, mtu, FALSE,
+							    NULL, NULL, NULL);
+	if (new_packet_size == packet_size)
+		return packet_size;
+
+	arv_device_set_integer_feature_value (device, "ArvGevSCPSPacketSize", new_packet_size, &local_error);
+	if (local_error != NULL) {
+		g_propagate_error (error, local_error);
+		return packet_size;
+	}
+
+	arv_info_device ("[GvDevice::auto_packet_size] Packet size set to %u bytes", new_packet_size);
+
+	return new_packet_size;
+}
+
 static guint
 auto_packet_size (ArvGvDevice *gv_device, gboolean exit_early, GError **error)
 {
 	ArvGvDevicePrivate *priv = arv_gv_device_get_instance_private (gv_device);
 	ArvDevice *device = ARV_DEVICE (gv_device);
+	ArvGvDeviceTestPacketData test_packet_data;
         ArvGcNode *node;
 	GSocket *socket;
 	GInetAddress *interface_address;
@@ -662,38 +873,30 @@ auto_packet_size (ArvGvDevice *gv_device, gboolean exit_early, GError **error)
 	guint16 port;
 	gboolean do_not_fragment;
 	guint max_size, min_size;
-	gint64 minimum, maximum, packet_size;
+	guint packet_size;
 	guint inc;
+	guint mtu;
 	char *buffer;
-	guint last_size = 0;
-	gboolean success;
+	GError *local_error = NULL;
 
 	g_return_val_if_fail (ARV_IS_GV_DEVICE (gv_device), 1500);
+
+	mtu = arv_network_get_interface_mtu_by_address (priv->interface_address);
+	if (mtu > 0)
+		arv_info_device ("[GvDevice::auto_packet_size] Interface MTU = %u bytes", mtu);
+	else
+		arv_info_device ("[GvDevice::auto_packet_size] Interface MTU unknown");
 
         node = arv_device_get_feature (device, "GevSCPSFireTestPacket");
 	if (!ARV_IS_GC_COMMAND (node) && !ARV_IS_GC_BOOLEAN (node)) {
 		arv_info_device ("[GvDevice::auto_packet_size] No GevSCPSFireTestPacket feature found");
-		return arv_device_get_integer_feature_value (device, "ArvGevSCPSPacketSize", error);
+		return _lower_packet_size_to_mtu (gv_device, mtu, error);
 	}
 
 	packet_size = arv_device_get_integer_feature_value (device, "ArvGevSCPSPacketSize", NULL);
 
-        /* PacketSize boundaries registers are device specific. Use the standard feature name for finding boundaries. If
-         * this feature is not present in the device Genicam data, it will fallback to the default definition inserted
-         * in arv_gv_device_load_genicam */
-	arv_device_get_integer_feature_bounds (device, "GevSCPSPacketSize", &minimum, &maximum, NULL);
-	inc = arv_device_get_integer_feature_increment (device, "GevSCPSPacketSize", NULL);
-	if (inc < 1)
-		inc = 1;
-
-	max_size = MIN (ARV_GVSP_MAXIMUM_PACKET_SIZE, maximum);
-	min_size = MAX (ARV_GVSP_MINIMUM_PACKET_SIZE, minimum);
-
-	if (max_size < min_size ||
-	    inc > max_size - min_size) {
-		arv_warning_device ("[GvDevice::auto_packet_size] Invalid ArvGevSCPSPacketSize properties");
+	if (!_get_packet_size_bounds (device, &min_size, &max_size, &inc))
 		return arv_device_get_integer_feature_value (device, "ArvGevSCPSPacketSize", error);
-	}
 
 	interface_address = g_inet_socket_address_get_address (G_INET_SOCKET_ADDRESS (priv->io_data->interface_address));
 	socket = g_socket_new (G_SOCKET_FAMILY_IPV4, G_SOCKET_TYPE_DATAGRAM, G_SOCKET_PROTOCOL_UDP, NULL);
@@ -719,58 +922,25 @@ auto_packet_size (ArvGvDevice *gv_device, gboolean exit_early, GError **error)
 
 	buffer = g_malloc (max_size);
 
-	success = test_packet_check (device, &poll_fd, socket, buffer, max_size, packet_size);
+	test_packet_data.device = device;
+	test_packet_data.socket = socket;
+	test_packet_data.poll_fd = &poll_fd;
+	test_packet_data.buffer = buffer;
+	test_packet_data.buffer_size = max_size;
+	test_packet_data.packet_size = packet_size;
 
 	/* When exit_early is set, the function only checks the current packet size is working.
 	 * If not, the full automatic packet size adjustment is run. */
-	if (success && exit_early) {
-		arv_info_device ("[GvDevice::auto_packet_size] Current packet size check successfull "
-				  "(%" G_GINT64_FORMAT " bytes)",
-				  packet_size);
-	} else {
-                GError *local_error = NULL;
-		guint current_size = packet_size;
+	packet_size = arv_gv_device_search_packet_size (packet_size, min_size, max_size, inc, mtu, exit_early,
+							_test_packet_size, &test_packet_data, &local_error);
 
-		do {
-			if (current_size == last_size ||
-                            min_size + inc > max_size)
-				break;
+	if (local_error == NULL && packet_size != test_packet_data.packet_size)
+		arv_device_set_integer_feature_value (device, "ArvGevSCPSPacketSize", packet_size, &local_error);
 
-			last_size = current_size;
-
-			arv_device_set_integer_feature_value (device, "ArvGevSCPSPacketSize", current_size, NULL);
-
-			current_size = arv_device_get_integer_feature_value (device, "ArvGevSCPSPacketSize", &local_error);
-                        if (local_error != NULL)
-                                break;
-
-			arv_info_device ("[GvDevice::auto_packet_size] Try packet size = %d (%d - min: %d - max: %d - inc: %d)",
-                                         current_size, last_size, min_size, max_size, inc);
-
-			success = test_packet_check (device, &poll_fd, socket, buffer, max_size, current_size);
-
-			if (success) {
-				packet_size = current_size;
-                                if (current_size == max_size)
-                                        break;
-
-				min_size = current_size;
-			} else {
-				max_size = current_size;
-			}
-
-                        current_size = min_size + (((max_size - min_size) / 2) / inc) * inc;
-		} while (TRUE);
-
-                if (local_error == NULL) {
-                        arv_device_set_integer_feature_value (device, "ArvGevSCPSPacketSize", packet_size, error);
-
-                        arv_info_device ("[GvDevice::auto_packet_size] Packet size set to %" G_GINT64_FORMAT " bytes",
-                                         packet_size);
-                } else {
-                        g_propagate_error (error, local_error);
-                }
-        }
+	if (local_error == NULL)
+		arv_info_device ("[GvDevice::auto_packet_size] Packet size set to %u bytes", packet_size);
+	else
+		g_propagate_error (error, local_error);
 
 	g_clear_pointer (&buffer, g_free);
 	g_clear_object (&socket);
@@ -788,9 +958,11 @@ auto_packet_size (ArvGvDevice *gv_device, gboolean exit_early, GError **error)
  * @error: a #GError placeholder, %NULL to ignore
  *
  * Automatically determine the biggest packet size that can be used data streaming, and set ArvGevSCPSPacketSize value
- * accordingly. This function relies on the GevSCPSFireTestPacket feature.
+ * accordingly. This function relies on the GevSCPSFireTestPacket feature. When the operating system reports the MTU of
+ * the network interface the device is reached through, the packet size never exceeds it.
  *
- * Returns: The automatic packet size, in bytes, or the current one if GevSCPSFireTestPacket is not supported.
+ * Returns: The automatic packet size, in bytes, or the current one if GevSCPSFireTestPacket is not supported, lowered
+ * to the interface MTU if larger.
  *
  * Since: 0.6.0
  */
@@ -810,7 +982,7 @@ arv_gv_device_auto_packet_size (ArvGvDevice *gv_device, GError **error)
  * arv_gv_device_auto_packet_size() for a description of the packet adjustment feature. The default behaviour is
  * @ARV_GV_PACKET_SIZE_ADJUSTEMENT_ON_FAILURE_ONCE, which means the packet size is adjusted if the current packet size
  * check fails, and only the first time arv_device_create_stream() is successfully called during @gv_device instance
- * life.
+ * life. An adjustment also lowers a current packet size larger than the MTU of the host network interface.
  *
  * Since: 0.8.3
  */
@@ -1917,6 +2089,66 @@ arv_gv_device_get_genicam (ArvDevice *device)
 	return priv->genicam;
 }
 
+/* A stream disables its stream channel when it is destroyed, unless a newer stream of the device configured the channel
+ * since, and may be using it: an application may destroy a stream after creating the next one, for example one that
+ * still holds the former stream of aravissrc, read from its 'stream' property, when the element creates a new stream
+ * at a caps change. The stream which configured a channel last owns it.
+ *
+ * The former stream may also be destroyed in another thread while the next one is being created. A stream therefore
+ * writes the destination of its channel and takes it, or releases it and disables it, with the stream channel lock
+ * held: the former stream either disables the channel before the next one configures it, or finds that it doesn't own
+ * it any more. The register accesses take the GVCP lock inside the stream channel lock, never the other way round. */
+
+void
+arv_gv_device_lock_stream_channels (ArvGvDevice *gv_device)
+{
+	ArvGvDevicePrivate *priv = arv_gv_device_get_instance_private (gv_device);
+
+	g_return_if_fail (ARV_IS_GV_DEVICE (gv_device));
+
+	g_mutex_lock (&priv->stream_channels_mutex);
+}
+
+void
+arv_gv_device_unlock_stream_channels (ArvGvDevice *gv_device)
+{
+	ArvGvDevicePrivate *priv = arv_gv_device_get_instance_private (gv_device);
+
+	g_return_if_fail (ARV_IS_GV_DEVICE (gv_device));
+
+	g_mutex_unlock (&priv->stream_channels_mutex);
+}
+
+/* Called with the stream channel lock held */
+
+void
+arv_gv_device_take_stream_channel (ArvGvDevice *gv_device, guint channel, gconstpointer stream)
+{
+	ArvGvDevicePrivate *priv = arv_gv_device_get_instance_private (gv_device);
+
+	g_return_if_fail (ARV_IS_GV_DEVICE (gv_device));
+	g_return_if_fail (stream != NULL);
+
+	g_hash_table_insert (priv->stream_channel_owners, GUINT_TO_POINTER (channel), (gpointer) stream);
+}
+
+/* Called with the stream channel lock held. Returns TRUE if @stream owned @channel, which it doesn't any more. */
+
+gboolean
+arv_gv_device_release_stream_channel (ArvGvDevice *gv_device, guint channel, gconstpointer stream)
+{
+	ArvGvDevicePrivate *priv = arv_gv_device_get_instance_private (gv_device);
+	gboolean is_owner;
+
+	g_return_val_if_fail (ARV_IS_GV_DEVICE (gv_device), FALSE);
+
+	is_owner = g_hash_table_lookup (priv->stream_channel_owners, GUINT_TO_POINTER (channel)) == stream;
+	if (is_owner)
+		g_hash_table_remove (priv->stream_channel_owners, GUINT_TO_POINTER (channel));
+
+	return is_owner;
+}
+
 /**
  * arv_gv_device_get_stream_options:
  * @gv_device: a #ArvGvDevice
@@ -2094,6 +2326,9 @@ arv_gv_device_init (ArvGvDevice *gv_device)
 	priv->genicam_xml = NULL;
 	priv->genicam_xml_size = 0;
 	priv->stream_options = ARV_GV_STREAM_OPTION_NONE;
+
+	g_mutex_init (&priv->stream_channels_mutex);
+	priv->stream_channel_owners = g_hash_table_new (g_direct_hash, g_direct_equal);
 }
 
 static void
@@ -2139,6 +2374,9 @@ arv_gv_device_finalize (GObject *object)
 
 	g_clear_object (&priv->interface_address);
 	g_clear_object (&priv->device_address);
+
+	g_clear_pointer (&priv->stream_channel_owners, g_hash_table_unref);
+	g_mutex_clear (&priv->stream_channels_mutex);
 
 	G_OBJECT_CLASS (arv_gv_device_parent_class)->finalize (object);
 }

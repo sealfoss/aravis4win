@@ -38,6 +38,7 @@
 #include <arvbufferprivate.h>
 #include <arvdebug.h>
 #include <arvmiscprivate.h>
+#include <arvresources.h>
 #include <string.h>
 #include <math.h>
 
@@ -1019,7 +1020,9 @@ arv_fake_camera_new_full (const char *serial_number, const char *genicam_filenam
 			fake_camera->priv->genicam_xml_size = 0;
 		}
 	} else {
-		GBytes *bytes = g_resources_lookup_data("/org/aravis/arv-fake-camera.xml",
+		/* From the resource bundle of the library itself, not from the registered ones: the reference is what
+		 * keeps the bundle, and the constructor that registers it, in a static link */
+		GBytes *bytes = g_resource_lookup_data (arvresources_get_resource (), "/org/aravis/arv-fake-camera.xml",
 							G_RESOURCE_LOOKUP_FLAGS_NONE, &error);
 
 		if (error != NULL) {

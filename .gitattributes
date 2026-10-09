@@ -1,0 +1,4 @@
+# Windows reads INF files, and the MakeCat definitions of their catalogs, with
+# CRLF line endings, whatever the platform of the checkout
+*.inf text eol=crlf
+*.cdf text eol=crlf

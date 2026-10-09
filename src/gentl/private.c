@@ -22,28 +22,46 @@
 
 #include"private.h"
 
-G_DEFINE_TYPE (ArvGentlEvent,arv_gentl_event,G_TYPE_OBJECT);
+#include<arvsystem.h>
 
-static void
-arv_gentl_event_class_init(ArvGentlEventClass* self)
+/* The producer can be unloaded and loaded again by the same process, while GLib keeps the types and the quarks it
+ * registered, with the pointers given at their registration. The handle types, which need no class or instance
+ * initialization, are registered without functions and with a copy of their name, and found by their name after a
+ * reload. G_DEFINE_TYPE would register functions and a name of the unloaded library. */
+
+static GType
+_get_handle_type (const char *name, guint class_size, guint instance_size)
 {
+	GType type = g_type_from_name (name);
+
+	if (type == G_TYPE_INVALID)
+		type = g_type_register_static_simple (G_TYPE_OBJECT, name, class_size, NULL, instance_size, NULL, 0);
+
+	return type;
 }
 
-static void
-arv_gentl_event_init(ArvGentlEvent* self)
+GType
+arv_gentl_event_get_type (void)
 {
+	static gsize type = 0;
+
+	if (g_once_init_enter (&type))
+		g_once_init_leave (&type, _get_handle_type ("ArvGentlEvent", sizeof (ArvGentlEventClass),
+							    sizeof (ArvGentlEvent)));
+
+	return type;
 }
 
-
-G_DEFINE_TYPE (ArvTransportLayer,arv_transport_layer,G_TYPE_OBJECT);
-
-static void
-arv_transport_layer_class_init(ArvTransportLayerClass* self)
+GType
+arv_transport_layer_get_type (void)
 {
-}
+	static gsize type = 0;
 
-static void arv_transport_layer_init(ArvTransportLayer* self)
-{
+	if (g_once_init_enter (&type))
+		g_once_init_leave (&type, _get_handle_type ("ArvTransportLayer", sizeof (ArvTransportLayerClass),
+							    sizeof (ArvTransportLayer)));
+
+	return type;
 }
 
 /* global variables */
@@ -62,11 +80,22 @@ GHashTable* gentl_events=NULL;
 GQuark
 gentl_error_quark (void)
 {
-  return g_quark_from_static_string ("gentl-error-quark");
+  /* Not a static string, which would be unloaded with the producer */
+  return g_quark_from_string ("gentl-error-quark");
 }
 
 GC_ERROR
-gentl_init()
+gentl_take_error (GC_ERROR code, GError *error)
+{
+	g_clear_error (&gentl_err);
+	gentl_err = g_error_new_literal (GENTL_ERROR, code, error != NULL ? error->message : "Unknown error");
+	g_clear_error (&error);
+
+	return code;
+}
+
+GC_ERROR
+gentl_init (void)
 {
 	if (gentl_GCInitLib != 0)
                 return GC_ERR_RESOURCE_IN_USE;
@@ -78,7 +107,7 @@ gentl_init()
 }
 
 GC_ERROR
-gentl_fini()
+gentl_fini (void)
 {
 	GENTL_ENSURE_INIT;
 	gentl_GCInitLib = 0;
@@ -87,6 +116,9 @@ gentl_fini()
 
 	gentl_events = NULL;
 
+	/* The last error of the calling thread, which would be lost with an unloaded producer */
+	g_clear_error (&gentl_err);
+
 	return GC_ERR_SUCCESS;
 }
 
@@ -94,6 +126,96 @@ gboolean
 gentl_is_initialized (void)
 {
 	return gentl_GCInitLib == 1;
+}
+
+/* The interfaces of the transport layer are the Aravis interfaces, the disabled ones included, except GenTL: its
+ * device discovery loads the producers of the GenTL path, this one included, which would enumerate itself again. */
+
+static gboolean
+_is_exposed_interface (const char *interface_id)
+{
+	return interface_id != NULL && g_strcmp0 (interface_id, "GenTL") != 0;
+}
+
+guint
+gentl_get_n_interfaces (void)
+{
+	guint n_interfaces = 0;
+	guint i;
+
+	for (i = 0; i < arv_get_n_interfaces (); i++)
+		if (_is_exposed_interface (arv_get_interface_id (i)))
+			n_interfaces++;
+
+	return n_interfaces;
+}
+
+const char *
+gentl_get_interface_id (guint index)
+{
+	guint i;
+
+	for (i = 0; i < arv_get_n_interfaces (); i++) {
+		const char *interface_id = arv_get_interface_id (i);
+
+		if (_is_exposed_interface (interface_id)) {
+			if (index == 0)
+				return interface_id;
+			index--;
+		}
+	}
+
+	return NULL;
+}
+
+/* Index of an exposed interface in the Aravis interface list, -1 if there is none with this id */
+
+static int
+_get_interface_index (const char *interface_id)
+{
+	guint i;
+
+	if (!_is_exposed_interface (interface_id))
+		return -1;
+
+	for (i = 0; i < arv_get_n_interfaces (); i++)
+		if (g_strcmp0 (arv_get_interface_id (i), interface_id) == 0)
+			return i;
+
+	return -1;
+}
+
+const char *
+gentl_get_tl_type (const char *protocol)
+{
+	if (g_strcmp0 (protocol, "GigEVision") == 0)
+		return "GEV";
+	if (g_strcmp0 (protocol, "USB3Vision") == 0)
+		return "U3V";
+
+	return "Custom";
+}
+
+GC_ERROR
+gentl_get_interface_info (const char *interface_id, INTERFACE_INFO_CMD iInfoCmd, INFO_DATATYPE *piType,
+			  void *pBuffer, size_t *piSize)
+{
+	int index;
+
+	index = _get_interface_index (interface_id);
+	if (index < 0)
+		return GC_ERR_INVALID_ID;
+
+	switch (iInfoCmd) {
+		case INTERFACE_INFO_ID:
+		case INTERFACE_INFO_DISPLAYNAME:
+			return gentl_to_buf (INFO_DATATYPE_STRING, pBuffer, arv_get_interface_id (index), piSize, piType);
+		case INTERFACE_INFO_TLTYPE:
+			return gentl_to_buf (INFO_DATATYPE_STRING, pBuffer,
+					     gentl_get_tl_type (arv_get_interface_protocol (index)), piSize, piType);
+		default:
+			return GC_ERR_INVALID_PARAMETER;
+	}
 }
 
 /* All events associated to one handle. Each handle can have at most one event of a given type as per GenTL spec. */

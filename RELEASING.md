@@ -50,6 +50,10 @@ $ git push origin x.y.z
 
 * Upload the tarball to github.
 
+  Publishing the release runs the Aravis-MSVC-GStreamer and Aravis-MinGW
+  workflows, which attach the Windows zip packages and their SHA-256 files to
+  the release once they pass. Check that they did.
+
 * Increment the version number in `meson.build`, and push the change.
 
 * Create a new topic on https://aravis-project.discourse.org to announce the new

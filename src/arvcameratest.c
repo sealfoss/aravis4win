@@ -46,6 +46,7 @@ static gboolean arv_option_gv_allow_broadcast_discovery_ack = FALSE;
 static char *arv_option_gv_port_range = NULL;
 static gboolean arv_option_native_buffers = FALSE;
 static char *arv_option_gv_discovery_interface = NULL;
+static gboolean arv_option_gentl = FALSE;
 
 /* clang-format off */
 static const GOptionEntry arv_option_entries[] =
@@ -233,6 +234,11 @@ static const GOptionEntry arv_option_entries[] =
 		&arv_option_gv_discovery_interface,     "Discovery using the interface",
 		"<interface>"
         },
+	{
+		"gentl",				'\0', 0, G_OPTION_ARG_NONE,
+		&arv_option_gentl,			"Enable the GenTL interface",
+		NULL
+	},
 	{
 		"native-buffers", 			'\0', 0, G_OPTION_ARG_NONE,
 		&arv_option_native_buffers, 		"Enable native buffers",
@@ -516,6 +522,9 @@ main (int argc, char **argv)
 		arv_gv_interface_set_discovery_interface_name (arv_option_gv_discovery_interface);
 
 	arv_enable_interface ("Fake");
+
+	if (arv_option_gentl)
+		arv_enable_interface ("GenTL");
 
 	arv_debug_enable (arv_option_debug_domains);
 

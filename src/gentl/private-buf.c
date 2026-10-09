@@ -71,6 +71,10 @@ gentl_to_buf (INFO_DATATYPE type, void* dst, const void* src, size_t* sz, INFO_D
 	if(sz==NULL)
                 return GC_ERR_INVALID_PARAMETER;
 
+	/* No value, for example a string Aravis doesn't know */
+	if(src==NULL)
+                return GC_ERR_NOT_AVAILABLE;
+
 	if(piType!=NULL)
                 *piType=type;
 
@@ -81,7 +85,7 @@ gentl_to_buf (INFO_DATATYPE type, void* dst, const void* src, size_t* sz, INFO_D
 	/* the call only queries about necessary storage */
 	if(dst==NULL) {
 		*sz=szSrc;
-		arv_trace_gentl ("   (returning required buffer size %ld)",szSrc);
+		arv_trace_gentl ("   (returning required buffer size %" G_GSIZE_FORMAT ")",(gsize) szSrc);
 		return GC_ERR_SUCCESS;
 	}
 
@@ -91,11 +95,12 @@ gentl_to_buf (INFO_DATATYPE type, void* dst, const void* src, size_t* sz, INFO_D
 	*sz=szSrc;
 	switch(type) {
 		case INFO_DATATYPE_UNKNOWN:
+			g_clear_error (&gentl_err);
 			gentl_err = g_error_new (GENTL_ERROR, GC_ERR_INVALID_PARAMETER,
                                                  "%s: INFO_DATATYPE_UNKNOWN is not allowed.", __FUNCTION__);
 			return GC_ERR_INVALID_PARAMETER;
 		case INFO_DATATYPE_STRING:
-			arv_trace_gentl("   (returning %ld-byte string: '%s')",szSrc,(const char*)src);
+			arv_trace_gentl("   (returning %" G_GSIZE_FORMAT "-byte string: '%s')",(gsize) szSrc,(const char*)src);
 			strcpy(dst,src);
 			break;
 		case INFO_DATATYPE_STRINGLIST:
@@ -114,37 +119,37 @@ gentl_to_buf (INFO_DATATYPE type, void* dst, const void* src, size_t* sz, INFO_D
 			break;
 		case INFO_DATATYPE_UINT32:
 			*(uint32_t*)dst=*(uint32_t*)src;
-			arv_trace_gentl("   (returning uint32_t: %d",*(uint32_t*)dst);
+			arv_trace_gentl("   (returning uint32_t: %u",*(uint32_t*)dst);
 			break;
 		case INFO_DATATYPE_INT64:
 			*(int64_t*)dst=*(int64_t*)src;
-			arv_trace_gentl("   (returning int64_t: %ld",*(int64_t*)dst);
+			arv_trace_gentl("   (returning int64_t: %" G_GINT64_FORMAT,(gint64) *(int64_t*)dst);
 			break;
 		case INFO_DATATYPE_UINT64:
-			*(uint64_t*)dst=*(uint64_t*)src; break;
-			arv_trace_gentl("   (returning uint64_t: %ld",*(uint64_t*)dst);
+			*(uint64_t*)dst=*(uint64_t*)src;
+			arv_trace_gentl("   (returning uint64_t: %" G_GUINT64_FORMAT,(guint64) *(uint64_t*)dst);
 			break;
 		case INFO_DATATYPE_FLOAT64:
-			*(double*)dst=*(double*)src; break;
-			arv_trace_gentl("   (returning uint64_t: %lf",*(double*)dst);
+			*(double*)dst=*(double*)src;
+			arv_trace_gentl("   (returning float64: %f",*(double*)dst);
 			break;
 		case INFO_DATATYPE_PTR:
 			dst=(void*)src;
 			arv_trace_gentl("   (returning pointer: %p",dst);
 			break;
 		case INFO_DATATYPE_BOOL8:
-			arv_trace_gentl("   (returning bool8: %u",*(char*)dst);
-			*(char*)dst=*(char*)src; break;
+			*(char*)dst=*(char*)src;
+			arv_trace_gentl("   (returning bool8: %d",*(char*)dst);
 			break;
 		case INFO_DATATYPE_SIZET:
-			*(size_t*)dst=*(size_t*)src; break;
-			arv_trace_gentl("   (returning size_t: %ld",*(size_t*)dst);
+			*(size_t*)dst=*(size_t*)src;
+			arv_trace_gentl("   (returning size_t: %" G_GSIZE_FORMAT,(gsize) *(size_t*)dst);
 			break;
 		case INFO_DATATYPE_BUFFER:
 			GENTL_NYI_DETAIL("%s","INFO_DATATYPE_BUFFER");
 			/* memcpy(dst,src,szSrc); break; */
 		case INFO_DATATYPE_PTRDIFF:
-			*(ptrdiff_t*)dst=*(ptrdiff_t*)src; break;
+			*(ptrdiff_t*)dst=*(ptrdiff_t*)src;
 			arv_trace_gentl("   (returning ptrdiff_t: %td",*(ptrdiff_t*)dst);
 			break;
 		default:

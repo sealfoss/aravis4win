@@ -3,11 +3,13 @@ gst_enabled = true
 gst_plugin_dir = get_option ('libdir') / 'gstreamer-1.0'
 
 gst_sources = [
-	'gstaravis.c'
+	'gstaravis.c',
+	'gstaravisdeviceprovider.c'
 ]
 
 gst_headers = [
-	'gstaravis.h'
+	'gstaravis.h',
+	'gstaravisdeviceprovider.h'
 ]
 
 gst_c_args = [
@@ -33,3 +35,7 @@ configure_file (input: 'gst-aravis-launch.in', output: 'gst-aravis-launch',
 		configuration: gst_script_config_data)
 configure_file (input: 'gst-aravis-inspect.in', output: 'gst-aravis-inspect',
 		configuration: gst_script_config_data)
+
+# For tests/fakeuvgst, which compiles the element into a test program against the fake libusb
+gst_source_files = files (gst_sources)
+gst_inc = include_directories ('.')

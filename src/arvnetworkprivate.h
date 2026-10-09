@@ -106,6 +106,28 @@ ARV_API struct sockaddr *	arv_network_interface_get_broadaddr	(ArvNetworkInterfa
 ARV_API const char *		arv_network_interface_get_name		(ArvNetworkInterface *a);
 ARV_API gboolean		arv_network_interface_is_loopback	(ArvNetworkInterface *a);
 
+/* Interface MTU, in bytes, 0 if unknown. Values an IPv4 interface can't have, like the 0xffffffff reported for the
+ * Windows loopback interface, or the 65536 bytes of the Linux one, are reported as unknown. */
+
+#define ARV_NETWORK_MINIMUM_MTU		68	/* Smallest datagram an IPv4 link must carry */
+#define ARV_NETWORK_MAXIMUM_MTU		65535	/* Largest IPv4 datagram */
+
+/* private, but used by tests */
+ARV_API guint			arv_network_interface_get_mtu		(ArvNetworkInterface *a);
+ARV_API guint			arv_network_get_interface_mtu_by_address (GInetAddress *address);
+
+/* Test hook: MTU returned by arv_network_get_interface_mtu_by_address() for loopback addresses, 0 for the actual one */
+ARV_API void			arv_network_set_loopback_mtu_override	(guint mtu);
+
+/* private, but used by tests */
+ARV_API gboolean		arv_network_is_host_address		(GInetAddress *address);
+ARV_API gboolean		arv_network_address_is_on_subnet	(GInetAddress *address,
+									 GInetAddress *interface_address,
+									 GInetAddress *netmask);
+ARV_API const void *		arv_network_ethernet_frame_get_udp_payload (const void *frame, size_t frame_size,
+									    size_t *payload_size,
+									    gboolean *is_incomplete);
+
 gboolean			arv_socket_set_recv_buffer_size		(int socket_fd, gint buffer_size);
 
 #ifdef G_OS_WIN32

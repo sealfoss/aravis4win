@@ -20,7 +20,6 @@
  * Author: Emmanuel Pacaud <emmanuel.pacaud@free.fr>
  */
 
-#include <glib/gprintf.h>
 #include <arv.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -180,7 +179,9 @@ arv_test_camera_add_result (ArvTestCamera *test_camera,
                         default: status_str = "";
                 }
 
-        g_fprintf (stdout, "%-35s %s %s\n", title, status_str, comment != NULL ? comment : "");
+        /* Not g_fprintf (stdout, ...): stdout belongs to the C runtime of this program, which may not be the one of
+         * GLib, as in an MSVC debug build used with a release build of GLib (see arv_debug_with_level()) */
+        printf ("%-35s %s %s\n", title, status_str, comment != NULL ? comment : "");
 
         test_camera->results = g_slist_append (test_camera->results,
                                                arv_test_result_new (title, test_camera->vendor_model,
@@ -1190,6 +1191,7 @@ static char *arv_option_debug_domains = NULL;
 static char *arv_option_uv_usb_mode = NULL;
 static gboolean arv_option_cache_check = FALSE;
 static gboolean arv_option_packet_socket = FALSE;
+static gboolean arv_option_gentl = FALSE;
 static gboolean arv_option_show_version = FALSE;
 
 static const GOptionEntry arv_option_entries[] =
@@ -1227,6 +1229,11 @@ static const GOptionEntry arv_option_entries[] =
 	{
 		"packet-socket",			'\0', 0, G_OPTION_ARG_NONE,
 		&arv_option_packet_socket,		"Enable use of packet socket",
+		NULL
+	},
+	{
+		"gentl",				'\0', 0, G_OPTION_ARG_NONE,
+		&arv_option_gentl,			"Enable the GenTL interface",
 		NULL
 	},
 	{
@@ -1309,6 +1316,9 @@ main (int argc, char **argv)
 		printf ("Invalid USB device I/O mode\n");
 		return EXIT_FAILURE;
 	}
+
+	if (arv_option_gentl)
+		arv_enable_interface ("GenTL");
 
         if (!arv_test_run (test,
                            arv_option_n_iterations,

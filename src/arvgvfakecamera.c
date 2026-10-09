@@ -52,6 +52,7 @@ enum
   PROP_SERIAL_NUMBER,
   PROP_GENICAM_FILENAME,
   PROP_GVSP_LOST_PACKET_RATIO,
+  PROP_GVSP_MTU,
   PROP_CM_DOMAIN
 };
 
@@ -78,6 +79,7 @@ typedef struct {
 	gboolean cancel;
 
 	double gvsp_lost_packet_ratio;
+	gint gvsp_mtu;
 } ArvGvFakeCameraPrivate;
 
 struct _ArvGvFakeCamera {
@@ -243,6 +245,20 @@ _handle_control_packet (ArvGvFakeCamera *gv_fake_camera, GSocket *socket,
 	return success;
 }
 
+/* A GVSP packet is lost randomly, or because it is larger than the MTU of the emulated network path to the host, IP and
+ * UDP headers included */
+
+static gboolean
+_is_gvsp_packet_lost (ArvGvFakeCamera *gv_fake_camera, size_t packet_size)
+{
+	guint mtu = g_atomic_int_get (&gv_fake_camera->priv->gvsp_mtu);
+
+	if (mtu > 0 && packet_size + ARV_GVSP_PACKET_UDP_OVERHEAD > mtu)
+		return TRUE;
+
+	return g_random_double () < gv_fake_camera->priv->gvsp_lost_packet_ratio;
+}
+
 static void *
 _thread (void *user_data)
 {
@@ -367,7 +383,7 @@ _thread (void *user_data)
                                                                   packet_buffer, ARV_GV_FAKE_CAMERA_BUFFER_SIZE,
                                                                   &packet_size);
 
-				if (g_random_double () >= gv_fake_camera->priv->gvsp_lost_packet_ratio)
+				if (!_is_gvsp_packet_lost (gv_fake_camera, packet_size))
 					g_socket_send_to (gv_fake_camera->priv->gvsp_socket, stream_address,
 							packet_buffer, packet_size, NULL, &error);
 				else
@@ -397,7 +413,7 @@ _thread (void *user_data)
                                                                      packet_buffer, ARV_GV_FAKE_CAMERA_BUFFER_SIZE,
                                                                      &packet_size);
 
-					if (g_random_double () >= gv_fake_camera->priv->gvsp_lost_packet_ratio)
+					if (!_is_gvsp_packet_lost (gv_fake_camera, packet_size))
 						g_socket_send_to (gv_fake_camera->priv->gvsp_socket, stream_address,
 								packet_buffer, packet_size, NULL, &error);
 					else
@@ -421,7 +437,7 @@ _thread (void *user_data)
                                                                   packet_buffer, ARV_GV_FAKE_CAMERA_BUFFER_SIZE,
                                                                   &packet_size);
 
-				if (g_random_double () >= gv_fake_camera->priv->gvsp_lost_packet_ratio)
+				if (!_is_gvsp_packet_lost (gv_fake_camera, packet_size))
 					g_socket_send_to (gv_fake_camera->priv->gvsp_socket, stream_address,
 							packet_buffer, packet_size, NULL, &error);
 				else
@@ -664,6 +680,9 @@ _set_property (GObject *object, guint prop_id, const GValue *value, GParamSpec *
 		case PROP_GVSP_LOST_PACKET_RATIO:
 			gv_fake_camera->priv->gvsp_lost_packet_ratio = g_value_get_double (value);
 			break;
+		case PROP_GVSP_MTU:
+			g_atomic_int_set (&gv_fake_camera->priv->gvsp_mtu, g_value_get_uint (value));
+			break;
 		default:
 			G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
 			break;
@@ -786,4 +805,14 @@ arv_gv_fake_camera_class_init (ArvGvFakeCameraClass *this_class)
 							      G_PARAM_WRITABLE | G_PARAM_CONSTRUCT |
 							      G_PARAM_STATIC_NAME | G_PARAM_STATIC_NICK |
 							      G_PARAM_STATIC_BLURB));
+	g_object_class_install_property (object_class,
+					 PROP_GVSP_MTU,
+					 g_param_spec_uint ("gvsp-mtu",
+							    "GVSP MTU",
+							    "MTU of the emulated network path to the host: larger GVSP "
+							    "packets are dropped, 0 for no limit",
+							    0, 65535, 0,
+							    G_PARAM_WRITABLE | G_PARAM_CONSTRUCT |
+							    G_PARAM_STATIC_NAME | G_PARAM_STATIC_NICK |
+							    G_PARAM_STATIC_BLURB));
 }

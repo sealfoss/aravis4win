@@ -456,7 +456,7 @@ arv_gvsp_leader_packet_get_timestamp (const ArvGvspPacket *packet, size_t packet
 
                 leader = (ArvGvspLeader *) arv_gvsp_packet_get_data (packet, packet_size);
 
-                if (G_LIKELY(leader) != NULL)
+                if (G_LIKELY (leader != NULL))
                         return ((guint64) g_ntohl (leader->timestamp_high) << 32) | g_ntohl (leader->timestamp_low);
         }
 

@@ -1,0 +1,36 @@
+Looking for camera 'Aravis-Fake-GV01'
+vendor name            = Aravis
+model name             = Fake
+device serial number   = GV01
+image width            = 512
+image height           = 512
+horizontal binning     = 1
+vertical binning       = 1
+exposure               = 10000 µs
+gain                   = 0 dB
+payload                = 262144 bytes
+gv n_stream channels   = 1
+gv current channel     = 0
+gv packet delay        = 0 ns
+gv packet size         = 1400 bytes
+ 15 frames/s -    3.93 MiB/s - 9 errors
+ 15 frames/s -    3.93 MiB/s - 11 errors
+ 21 frames/s -    5.51 MiB/s - 5 errors
+n_completed_buffers    = 51
+n_failures             = 25
+n_underruns            = 0
+n_timeouts             = 0
+n_aborted              = 0
+n_missing_frames       = 0
+n_size_mismatch_errors = 0
+n_received_packets     = 14784
+n_missing_packets      = 2430
+n_error_packets        = 0
+n_ignored_packets      = 0
+n_resend_requests      = 0
+n_resent_packets       = 0
+n_resend_ratio_reached = 0
+n_resend_disabled      = 0
+n_duplicated_packets   = 0
+n_transferred_bytes    = 19999248
+n_ignored_bytes        = 0

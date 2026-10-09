@@ -100,13 +100,16 @@ GCGetLastError (GC_ERROR *piErrorCode, char *sErrText, size_t *piSize)
 {
 	if(piSize == NULL)
                 return GC_ERR_INVALID_PARAMETER;
+	/* The errors are in the GENTL_ERROR domain, with a GenTL error code */
+	if (piErrorCode != NULL)
+		*piErrorCode = gentl_err != NULL ? gentl_err->code : GC_ERR_SUCCESS;
 	if (gentl_err == NULL) {
 		arv_trace_gentl("%s: No error.",__FUNCTION__);
 		return gentl_to_buf(INFO_DATATYPE_STRING,sErrText,"No error.",piSize,NULL);
 	}
 	if(sErrText == NULL) {
 		*piSize = strlen(gentl_err->message) + 1;
-		arv_trace_gentl("   (%s: message length is %ld)",__FUNCTION__,*piSize);
+		arv_trace_gentl("   (%s: message length is %" G_GSIZE_FORMAT ")",__FUNCTION__,(gsize) *piSize);
 		return GC_ERR_SUCCESS;
 	}
 
@@ -133,9 +136,15 @@ GCCloseLib (void)
 GC_ERROR
 GCReadPort (PORT_HANDLE hPort, uint64_t iAddress, void *pBuffer, size_t *piSize )
 {
-	arv_trace_gentl ("%s (hPort=%s[%p],iAddress=%#lx,pBuffer=%p,piSize=%ld)",
-                         __FUNCTION__,G_OBJECT_TYPE_NAME(hPort),hPort,iAddress,pBuffer,*piSize);
+	GError *error = NULL;
+
+	arv_trace_gentl ("%s (hPort=%s[%p],iAddress=%#" G_GINT64_MODIFIER "x,pBuffer=%p,piSize=%" G_GSIZE_FORMAT ")",
+                         __FUNCTION__,G_OBJECT_TYPE_NAME(hPort),hPort,(guint64) iAddress,pBuffer,
+                         (gsize) (piSize != NULL ? *piSize : 0));
 	_GC_CHECK_HANDLE;
+
+	if (piSize == NULL)
+		return GC_ERR_INVALID_PARAMETER;
 
 	if (ARV_IS_TRANSPORT_LAYER(hPort) || ARV_IS_INTERFACE(hPort)) {
 		if(iAddress>0)
@@ -144,13 +153,13 @@ GCReadPort (PORT_HANDLE hPort, uint64_t iAddress, void *pBuffer, size_t *piSize 
 	}
 
 	if (ARV_IS_CAMERA(hPort)) {
-		if (!arv_device_read_memory(arv_camera_get_device(hPort),iAddress,*piSize,pBuffer,&gentl_err))
-                        return GC_ERR_IO;
+		if (!arv_device_read_memory(arv_camera_get_device(hPort),iAddress,*piSize,pBuffer,&error))
+                        return gentl_take_error (GC_ERR_IO, error);
 		return GC_ERR_SUCCESS;
 	}
 	if (ARV_IS_DEVICE(hPort)) {
-		if (!arv_device_read_memory(ARV_DEVICE(hPort),iAddress,*piSize,pBuffer,&gentl_err))
-                        return GC_ERR_IO;
+		if (!arv_device_read_memory(ARV_DEVICE(hPort),iAddress,*piSize,pBuffer,&error))
+                        return gentl_take_error (GC_ERR_IO, error);
 		return GC_ERR_SUCCESS;
 	}
 	GENTL_NYI_DETAIL ("only TL/IF/DEV/PORT ports implemented (hPort=%s[%p])",G_OBJECT_TYPE_NAME(hPort),hPort);
@@ -192,10 +201,11 @@ GCGetPortInfo (PORT_HANDLE hPort, PORT_INFO_CMD iInfoCmd, INFO_DATATYPE *piType,
 		switch (iInfoCmd) {
 			case PORT_INFO_PORTNAME:
                                 {
-                                        const char* id=arv_camera_get_device_id(hPort,&gentl_err);
+                                        GError *error = NULL;
+                                        const char* id=arv_camera_get_device_id(hPort,&error);
 
                                         if(id==NULL)
-                                                return GC_ERR_IO;
+                                                return gentl_take_error (GC_ERR_IO, error);
                                         return gentl_to_buf(INFO_DATATYPE_STRING,pBuffer,id,piSize,piType);
                                 }
                         default:
@@ -208,11 +218,12 @@ GCGetPortInfo (PORT_HANDLE hPort, PORT_INFO_CMD iInfoCmd, INFO_DATATYPE *piType,
                 switch(iInfoCmd) {
                         case PORT_INFO_PORTNAME:
                                 {
+                                        GError *error = NULL;
                                         const char* n;
 
-                                        n=arv_device_get_string_feature_value(hPort,"DeviceID",&gentl_err);
+                                        n=arv_device_get_string_feature_value(hPort,"DeviceID",&error);
                                         if(n==NULL)
-                                                return GC_ERR_IO;
+                                                return gentl_take_error (GC_ERR_IO, error);
 
                                         return gentl_to_buf(INFO_DATATYPE_STRING,pBuffer,n,piSize,piType);
                                 }
@@ -264,7 +275,7 @@ GCGetNumPortURLs (PORT_HANDLE hPort, uint32_t *piNumURLs)
                                  G_OBJECT_TYPE_NAME(hPort),hPort);
         }
 
-	arv_trace_gentl("   (returning %d)",*piNumURLs);
+	arv_trace_gentl("   (returning %u)",*piNumURLs);
 
 	return GC_ERR_SUCCESS;
 }
@@ -273,7 +284,7 @@ GC_ERROR
 GCGetPortURLInfo (PORT_HANDLE hPort, uint32_t iURLIndex, URL_INFO_CMD iInfoCmd, INFO_DATATYPE *piType,
                   void *pBuffer, size_t *piSize)
 {
-	arv_trace_gentl("%s (hPort=%s[%p],iURLIndex=%d,iInfoCmd=%d)",
+	arv_trace_gentl("%s (hPort=%s[%p],iURLIndex=%u,iInfoCmd=%d)",
                         __FUNCTION__,G_OBJECT_TYPE_NAME(hPort),hPort,iURLIndex,iInfoCmd);
 	_GC_CHECK_HANDLE;
 
@@ -284,10 +295,11 @@ GCGetPortURLInfo (PORT_HANDLE hPort, uint32_t iURLIndex, URL_INFO_CMD iInfoCmd, 
                                         char buf[100];
                                         gboolean tl=ARV_IS_TRANSPORT_LAYER(hPort);
 
+                                        /* The size of a local URL is hexadecimal */
                                         g_snprintf (buf,sizeof(buf),
-                                                    tl ? "Local:aravis-gentl-transport.xml;0;%ld" :
-                                                    "Local:aravis-gentl-interface.xml;0;%ld",
-                                                    (tl?sizeof(_XML_TL):sizeof(_XML_IF))+1);
+                                                    tl ? "Local:aravis-gentl-transport.xml;0;%" G_GSIZE_MODIFIER "x" :
+                                                    "Local:aravis-gentl-interface.xml;0;%" G_GSIZE_MODIFIER "x",
+                                                    (gsize) ((tl?sizeof(_XML_TL):sizeof(_XML_IF))+1));
 
                                         return gentl_to_buf(INFO_DATATYPE_STRING,pBuffer,buf,piSize,piType);
                                 }

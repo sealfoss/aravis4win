@@ -744,6 +744,219 @@ set_features_from_string_test (void)
 	g_object_unref (device);
 }
 
+/* The device list functions that aravissrc and its device provider use, from any thread. These tests select the Fake
+ * interface only, so that no device discovery reaches the network or the USB devices: they run after the others. */
+
+static void
+open_device_on_interface_test (void)
+{
+	ArvDevice *device;
+	GError *error = NULL;
+
+	/* Even through an interface disabled for device discovery */
+	arv_disable_interface ("Fake");
+
+	device = arv_open_device_on_interface ("Fake", "Fake_1", &error);
+	g_assert_no_error (error);
+	g_assert (ARV_IS_FAKE_DEVICE (device));
+	g_object_unref (device);
+
+	/* The first device of the interface */
+	device = arv_open_device_on_interface ("Fake", NULL, &error);
+	g_assert_no_error (error);
+	g_assert (ARV_IS_FAKE_DEVICE (device));
+	g_object_unref (device);
+
+	device = arv_open_device_on_interface ("Fake", "Nope", &error);
+	g_assert_null (device);
+	g_assert_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_NOT_FOUND);
+	g_assert_nonnull (g_strrstr (error->message, "'Nope' not found on interface 'Fake'"));
+	g_clear_error (&error);
+
+	device = arv_open_device_on_interface ("Nope", "Fake_1", &error);
+	g_assert_null (device);
+	g_assert_error (error, ARV_DEVICE_ERROR, ARV_DEVICE_ERROR_INVALID_PARAMETER);
+	g_clear_error (&error);
+
+	arv_select_interface ("Fake");
+}
+
+static void
+device_interface_id_test (void)
+{
+	arv_select_interface ("Fake");
+	arv_update_device_list ();
+
+	g_assert_cmpuint (arv_get_n_devices (), ==, 1);
+	g_assert_cmpstr (arv_get_device_id (0), ==, "Fake_1");
+	g_assert_cmpstr (arv_get_device_interface_id (0), ==, "Fake");
+	g_assert_null (arv_get_device_interface_id (1));
+}
+
+static void
+device_list_strings_test (void)
+{
+	const char *device_id;
+	const char *vendor;
+
+	arv_select_interface ("Fake");
+	arv_update_device_list ();
+
+	device_id = arv_get_device_id (0);
+	vendor = arv_get_device_vendor (0);
+
+	/* The strings stay valid after the next updates of the list: interned, they are even the same */
+	arv_update_device_list ();
+	arv_update_device_list ();
+
+	g_assert_cmpstr (device_id, ==, "Fake_1");
+	g_assert_cmpstr (vendor, ==, "Aravis");
+	g_assert (device_id == arv_get_device_id (0));
+	g_assert (vendor == arv_get_device_vendor (0));
+}
+
+/* The generation of the device list increases when the list changes, here when the Fake interface joins or leaves it.
+ * The queries leave it as it is, and so do the updates that find the same device, including those of the opening
+ * functions: another thread updating the list again and again must not keep a reader of the list from finding the
+ * same generation before and after its queries. tests/fakeuvsystem.c changes the devices themselves. */
+
+static guint64
+check_generation_increased (guint64 generation)
+{
+	guint64 new_generation = arv_get_device_list_generation ();
+
+	g_assert_cmpuint (new_generation, >, generation);
+
+	return new_generation;
+}
+
+static void
+device_list_generation_test (void)
+{
+	ArvDevice *device;
+	GError *error = NULL;
+	guint64 generation;
+
+	arv_select_interface ("Fake");
+	arv_update_device_list ();
+	generation = arv_get_device_list_generation ();
+
+	g_assert_cmpuint (arv_get_n_devices (), ==, 1);
+	g_assert_cmpstr (arv_get_device_id (0), ==, "Fake_1");
+	g_assert_cmpstr (arv_get_device_vendor (0), ==, "Aravis");
+	g_assert_cmpstr (arv_get_device_interface_id (0), ==, "Fake");
+	g_assert_cmpuint (arv_get_device_list_generation (), ==, generation);
+
+	/* The same device */
+	arv_update_device_list ();
+	g_assert_cmpuint (arv_get_device_list_generation (), ==, generation);
+
+	device = arv_open_device ("Fake_1", &error);
+	g_assert_no_error (error);
+	g_object_unref (device);
+	g_assert_cmpuint (arv_get_device_list_generation (), ==, generation);
+
+	/* After an update of the list of the interface */
+	device = arv_open_device_on_interface ("Fake", NULL, &error);
+	g_assert_no_error (error);
+	g_object_unref (device);
+	g_assert_cmpuint (arv_get_device_list_generation (), ==, generation);
+
+	device = arv_open_device_on_interface ("Fake", "Fake_1", &error);
+	g_assert_no_error (error);
+	g_object_unref (device);
+	g_assert_cmpuint (arv_get_device_list_generation (), ==, generation);
+
+	/* The interfaces the list covers */
+	arv_disable_interface ("Fake");
+	g_assert_cmpuint (arv_get_n_devices (), ==, 0);
+	generation = check_generation_increased (generation);
+
+	arv_disable_interface ("Fake");
+	g_assert_cmpuint (arv_get_device_list_generation (), ==, generation);
+
+	arv_enable_interface ("Fake");
+	g_assert_cmpuint (arv_get_n_devices (), ==, 1);
+	generation = check_generation_increased (generation);
+
+	arv_enable_interface ("Fake");
+	arv_select_interface ("Fake");
+	g_assert_cmpuint (arv_get_device_list_generation (), ==, generation);
+
+	/* Another interface instead, whatever its devices */
+	arv_select_interface ("GigEVision");
+	generation = check_generation_increased (generation);
+
+	arv_select_interface ("Fake");
+	g_assert_cmpuint (arv_get_n_devices (), ==, 1);
+	check_generation_increased (generation);
+}
+
+/* Lists the devices from another thread while the test opens the first device of the Fake interface, which updates
+ * the device list of that interface */
+
+typedef struct {
+	gint stop;
+	gint n_listings;
+	gint n_bad_listings;
+} DeviceLister;
+
+static gpointer
+device_lister_run (gpointer data)
+{
+	DeviceLister *lister = data;
+
+	while (!g_atomic_int_get (&lister->stop)) {
+		const char *device_id;
+		const char *vendor;
+
+		arv_update_device_list ();
+		device_id = arv_get_device_id (0);
+		vendor = arv_get_device_vendor (0);
+
+		/* Let the other thread update the list before reading the strings */
+		g_thread_yield ();
+
+		if (g_strcmp0 (device_id, "Fake_1") != 0 ||
+		    g_strcmp0 (vendor, "Aravis") != 0 ||
+		    g_strcmp0 (arv_get_device_interface_id (0), "Fake") != 0)
+			g_atomic_int_inc (&lister->n_bad_listings);
+		g_atomic_int_inc (&lister->n_listings);
+	}
+
+	return NULL;
+}
+
+#define DEVICE_LIST_THREADS_N_OPENINGS	50
+
+static void
+device_list_threads_test (void)
+{
+	DeviceLister lister = {FALSE, 0, 0};
+	GThread *thread;
+	unsigned int i;
+
+	arv_select_interface ("Fake");
+
+	thread = g_thread_new ("lister", device_lister_run, &lister);
+
+	for (i = 0; i < DEVICE_LIST_THREADS_N_OPENINGS || g_atomic_int_get (&lister.n_listings) < 10; i++) {
+		GError *error = NULL;
+		ArvDevice *device;
+
+		device = arv_open_device_on_interface ("Fake", NULL, &error);
+		g_assert_no_error (error);
+		g_assert (ARV_IS_FAKE_DEVICE (device));
+		g_object_unref (device);
+	}
+
+	g_atomic_int_set (&lister.stop, TRUE);
+	g_thread_join (thread);
+
+	g_assert_cmpint (lister.n_listings, >=, 10);
+	g_assert_cmpint (lister.n_bad_listings, ==, 0);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -767,6 +980,12 @@ main (int argc, char *argv[])
 	g_test_add_func ("/fake/camera-device", camera_device_test);
 	g_test_add_func ("/fake/camera-trigger-selector", camera_trigger_selector_test);
 	g_test_add_func ("/fake/set-features-from-string", set_features_from_string_test);
+	/* The device list functions, after the others, as they select the Fake interface only */
+	g_test_add_func ("/fake/open-device-on-interface", open_device_on_interface_test);
+	g_test_add_func ("/fake/device-interface-id", device_interface_id_test);
+	g_test_add_func ("/fake/device-list-strings", device_list_strings_test);
+	g_test_add_func ("/fake/device-list-generation", device_list_generation_test);
+	g_test_add_func ("/fake/device-list-threads", device_list_threads_test);
 
 	result = g_test_run();
 

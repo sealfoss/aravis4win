@@ -40,11 +40,14 @@ G_BEGIN_DECLS
 
 typedef struct _GstAravis GstAravis;
 typedef struct _GstAravisClass GstAravisClass;
+typedef struct _GstAravisDeviceState GstAravisDeviceState;
+typedef struct _GstAravisStreamState GstAravisStreamState;
 
 struct _GstAravis {
 	GstPushSrc element;
 
 	char *camera_name;
+	char *interface_id;
 
 	double gain;
 	ArvAuto gain_auto;
@@ -68,14 +71,34 @@ struct _GstAravis {
         gboolean packet_resend;
 
 	ArvUvUsbMode usb_mode;
+	guint usb_maximum_transfer_size;
 
 	gint payload;
 
+	/* buffer-timeout property, in ms: -1 = automatic (buffer_timeout_us), 0 = wait forever */
+	gint buffer_timeout_ms;
+	/* Automatic timeout, computed from the frame rate */
 	guint64 buffer_timeout_us;
         gdouble frame_rate;
 
+	/* Set by unlock (), cleared by unlock_stop (); atomic */
+	gint flushing;
+
 	ArvCamera *camera;
 	ArvStream *stream;
+	/* Whether the element started the acquisition of its stream, which it stops itself */
+	gboolean stream_started;
+	/* Set while set_caps () has released the stream of the previous caps, and notifies it without the object lock,
+	 * before it creates the next one: the element still streams from its camera */
+	gboolean replacing_stream;
+	/* With the stream: what the element shares with the frames it lends downstream about the stream */
+	GstAravisStreamState *stream_state;
+
+	/* With the camera: the state its device's signal handlers share, the control-lost handler, and the name of
+	 * the camera for error messages */
+	GstAravisDeviceState *device_state;
+	gulong control_lost_handler;
+	char *camera_label;
 
 	GstCaps *all_caps;
 
@@ -96,6 +119,11 @@ struct _GstAravisClass {
 };
 
 GType gst_aravis_get_type (void);
+
+/* For the device provider, in the same plugin */
+
+gboolean	gst_aravis_select_camera	(GstAravis *gst_aravis, const char *interface_id,
+						 const char *camera_name);
 
 G_END_DECLS
 

@@ -1,1 +1,4 @@
 gi-docgen/
+libusb-*/
+packagecache/
+.wraplock

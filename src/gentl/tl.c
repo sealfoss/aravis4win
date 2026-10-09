@@ -38,7 +38,8 @@ TLOpen (TL_HANDLE *phTL)
 	if (gentl_transport_layer!=NULL)
                 return GC_ERR_RESOURCE_IN_USE;
 
-        arv_disable_interface ("GenTL");
+	/* The interface selection of the process is left as it is: the GenTL interface is not exposed, and the
+	 * devices are opened by their interface. */
 
 	gentl_transport_layer= g_object_new (ARV_TYPE_TRANSPORT_LAYER,NULL);
 	*phTL=(void*)gentl_transport_layer;
@@ -61,7 +62,11 @@ TLClose (TL_HANDLE hTL)
 GC_ERROR
 TLGetInfo (TL_HANDLE hTL, TL_INFO_CMD iInfoCmd, INFO_DATATYPE *piType, void *pBuffer, size_t *piSize)
 {
-        GENTL_NYI;
+	arv_trace_gentl("%s (hTL=%s[%p], iInfoCmd=%d)",__FUNCTION__,G_OBJECT_TYPE_NAME(hTL),hTL,iInfoCmd);
+	_TL_CHECK_HANDLE;
+
+	/* The information of the system module */
+	return GCGetInfo (iInfoCmd, piType, pBuffer, piSize);
 }
 
 GC_ERROR
@@ -73,8 +78,8 @@ TLGetNumInterfaces (TL_HANDLE hTL, uint32_t *piNumIfaces)
 	if(!piNumIfaces)
                 return GC_ERR_INVALID_PARAMETER;
 
-	*piNumIfaces=arv_get_n_interfaces();
-	arv_trace_gentl("   → %d interfaces",*piNumIfaces);
+	*piNumIfaces=gentl_get_n_interfaces();
+	arv_trace_gentl("   → %u interfaces",*piNumIfaces);
 
 	return GC_ERR_SUCCESS;
 }
@@ -82,43 +87,31 @@ TLGetNumInterfaces (TL_HANDLE hTL, uint32_t *piNumIfaces)
 GC_ERROR
 TLGetInterfaceID (TL_HANDLE hTL, uint32_t iIndex,  char *sID, size_t *piSize)
 {
-	arv_trace_gentl("%s (hTL=%s[%p],iIndex=%d,sID=%p,piSize=%p)",__FUNCTION__,G_OBJECT_TYPE_NAME(hTL),hTL,iIndex,sID,piSize);
+	arv_trace_gentl("%s (hTL=%s[%p],iIndex=%u,sID=%p,piSize=%p)",__FUNCTION__,G_OBJECT_TYPE_NAME(hTL),hTL,iIndex,sID,piSize);
 	_TL_CHECK_HANDLE;
 
-	if(iIndex>=arv_get_n_interfaces())
+	if(iIndex>=gentl_get_n_interfaces())
                 return GC_ERR_INVALID_INDEX;
 
-	return gentl_to_buf(INFO_DATATYPE_STRING,sID,arv_get_interface_id(iIndex),piSize,NULL);
+	return gentl_to_buf(INFO_DATATYPE_STRING,sID,gentl_get_interface_id(iIndex),piSize,NULL);
 }
 
 GC_ERROR
 TLGetInterfaceInfo (TL_HANDLE hTL, const char *sIfaceID, INTERFACE_INFO_CMD iInfoCmd, INFO_DATATYPE *piType,
                     void *pBuffer, size_t *piSize)
 {
-	ArvInterface *iface;
-
 	arv_trace_gentl("%s (hTL=%s[%p], sIfaceID=%s, iInfoCmd=%d)",__FUNCTION__,G_OBJECT_TYPE_NAME(hTL),hTL,sIfaceID,iInfoCmd);
 	_TL_CHECK_HANDLE;
 
-	iface=arv_get_interface_by_id(sIfaceID);
-	if (!iface)
-                return GC_ERR_INVALID_ID;
-
-	switch (iInfoCmd) {
-		case INTERFACE_INFO_ID:
-		case INTERFACE_INFO_DISPLAYNAME:
-		case INTERFACE_INFO_TLTYPE:
-			return gentl_to_buf(INFO_DATATYPE_STRING,pBuffer,
-                                            arv_interface_get_device_protocol(iface,/*unused*/0),piSize,piType);
-		default:
-			return GC_ERR_INVALID_PARAMETER;
-	}
+	/* Available before TLOpenInterface, which updates the device list */
+	return gentl_get_interface_info (sIfaceID, iInfoCmd, piType, pBuffer, piSize);
 }
 
 GC_ERROR
 TLOpenInterface (TL_HANDLE hTL, const char *sIfaceID, IF_HANDLE *phIface)
 {
 	ArvInterface* iface;
+	guint i;
 
 	/* TODO: return GC_ERR_RESOURCE_IN_USE if the iface was already open via TLOpenInterface */
 	arv_trace_gentl("%s (hTL=%s[%p], sIfaceID=%p, phIface=%p)",__FUNCTION__,G_OBJECT_TYPE_NAME(hTL),hTL,sIfaceID,phIface);
@@ -127,24 +120,39 @@ TLOpenInterface (TL_HANDLE hTL, const char *sIfaceID, IF_HANDLE *phIface)
 	if (sIfaceID==NULL || phIface==NULL)
                 return GC_ERR_INVALID_PARAMETER;
 
-	iface=arv_get_interface_by_id(sIfaceID);
-	if (!iface)
-                return GC_ERR_INVALID_ID;
+	/* Only the interfaces of the transport layer, which excludes GenTL */
+	for (i = 0; i < gentl_get_n_interfaces (); i++) {
+		const char *interface_id = gentl_get_interface_id (i);
 
-	*phIface=(void*)iface;
-	arv_interface_update_device_list(iface);
+		if (g_strcmp0 (interface_id, sIfaceID) == 0) {
+			iface = arv_get_interface_by_id (interface_id);
+			if (!iface)
+				return GC_ERR_INVALID_ID;
 
-	return GC_ERR_SUCCESS;
+			/* For IFGetInfo */
+			g_object_set_data (G_OBJECT (iface), GENTL_INTERFACE_ID_KEY, (gpointer) interface_id);
+
+			/* Referenced until IFClose: arv_shutdown() destroys the interface instances of Aravis, while
+			 * the consumer may still use the handle, at least to close it with a device opened before. */
+			*phIface=(void*)g_object_ref (iface);
+			arv_interface_update_device_list(iface);
+
+			return GC_ERR_SUCCESS;
+		}
+	}
+
+	return GC_ERR_INVALID_ID;
 }
 
 GC_ERROR
 TLUpdateInterfaceList (TL_HANDLE hTL, bool8_t *pbChanged, uint64_t iTimeout)
 {
-	arv_trace_gentl("%s (hTL=%s[%p], pbChanged=%p, iTimeout=%ld)",__FUNCTION__,G_OBJECT_TYPE_NAME(hTL),hTL,pbChanged,iTimeout);
+	arv_trace_gentl("%s (hTL=%s[%p], pbChanged=%p, iTimeout=%" G_GUINT64_FORMAT ")",__FUNCTION__,G_OBJECT_TYPE_NAME(hTL),hTL,pbChanged,(guint64) iTimeout);
 	_TL_CHECK_HANDLE;
 
+	/* The interface list never changes */
 	if(pbChanged)
-                pbChanged=0;
+                *pbChanged=0;
 
 	return GC_ERR_SUCCESS;
 }

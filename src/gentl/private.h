@@ -70,21 +70,42 @@ extern GENTL_THREAD_LOCAL_STORAGE GError* gentl_err;
 GQuark gentl_error_quark (void);
 
 /*
+Replaces the last error by an error of Aravis, which is freed, and returns code.
+*/
+GC_ERROR gentl_take_error (GC_ERROR code, GError *error);
+
+/*
 Stubs for unimplemented functions.
 */
 #define GENTL_NYI { \
 	arv_warning_gentl("%s not yet implemented.",__FUNCTION__); \
+	g_clear_error (&gentl_err); \
 	gentl_err = g_error_new (GENTL_ERROR, GC_ERR_NOT_IMPLEMENTED, "%s not yet implemented in Aravis GenTL", __FUNCTION__); \
 	return GC_ERR_NOT_IMPLEMENTED; }
 
 #define GENTL_NYI_DETAIL(fmt,...) { \
 	arv_warning_gentl("%s: not yet implemented: " fmt,__FUNCTION__,__VA_ARGS__); \
+	g_clear_error (&gentl_err); \
 	gentl_err = g_error_new (GENTL_ERROR, GC_ERR_NOT_IMPLEMENTED, "%s (Aravis GenTL) not yet implemented: " fmt,__FUNCTION__,__VA_ARGS__); \
 	return GC_ERR_NOT_IMPLEMENTED; }
 
+/*
+Interfaces of the transport layer: the Aravis interfaces, except GenTL. Implementation in private.c.
+The interface handles are the Aravis interfaces, with the interface id set by TLOpenInterface as object data.
+*/
+#define GENTL_INTERFACE_ID_KEY "arv-gentl-interface-id"
+
+guint gentl_get_n_interfaces (void);
+const char *gentl_get_interface_id (guint index);
+GC_ERROR gentl_get_interface_info (const char *interface_id, INTERFACE_INFO_CMD iInfoCmd, INFO_DATATYPE *piType,
+				   void *pBuffer, size_t *piSize);
+/* GenTL transport layer type of an Aravis protocol */
+const char *gentl_get_tl_type (const char *protocol);
+
 
 /*
-Handle type for the transport layer (for the rest, we use corresponding Aravis types)
+Handle type for the transport layer (for the rest, we use corresponding Aravis types).
+The handle types are registered so that the producer can be unloaded and loaded again, see private.c.
 */
 struct _ArvTransportLayer{ GObject parent_instance; };
 #define ARV_TYPE_TRANSPORT_LAYER (arv_transport_layer_get_type ())

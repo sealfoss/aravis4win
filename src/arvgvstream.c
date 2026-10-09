@@ -61,6 +61,7 @@
 #define ARV_GV_STREAM_DISCARD_LATE_FRAME_THRESHOLD	100
 #define ARV_GV_STREAM_BUFFER_SIZE_PROTOCOL_OVERHEAD     1024 /* Some room for protocol overhead (IP + UDP + GV) */
 #define ARV_GV_STREAM_MIN_BUFFER_SIZE                   20 * 1024
+#define ARV_GV_STREAM_LEADER_TRAILER_ONLY_WARNING_PERIOD_US	10000000 /* At most one warning every 10 s */
 
 enum {
 	ARV_GV_STREAM_PROPERTY_0,
@@ -107,6 +108,9 @@ typedef struct {
 	guint64 frame_id;
 
         gboolean leader_received;
+	gboolean trailer_received;
+	guint n_data_packets;	/* Received payload and multipart packets */
+	guint n_full_size_data_packets;	/* Received data packets as large as the packet size */
 
         gsize received_size;
 
@@ -153,6 +157,7 @@ struct _ArvGvStreamThreadData {
 
 	guint64 timestamp_tick_frequency;
 	guint scps_packet_size;
+	guint interface_mtu;	/* 0 if unknown */
 
 	guint16 packet_id;
 
@@ -161,6 +166,7 @@ struct _ArvGvStreamThreadData {
 	guint64 last_frame_id;
 
 	gboolean use_packet_socket;
+	gboolean incomplete_datagram_warned;
 
 	/* Statistics */
 
@@ -185,6 +191,9 @@ struct _ArvGvStreamThreadData {
 
         guint64 n_transferred_bytes;
         guint64 n_ignored_bytes;
+
+	guint64 n_leader_trailer_only_failures;
+	guint64 leader_trailer_only_warning_time_us;
 
 	ArvHistogram *histogram;
 	guint32 statistic_count;
@@ -745,6 +754,104 @@ _missing_packet_check (ArvGvStreamThreadData *thread_data,
 	}
 }
 
+/* Data packets fill the packet size, IP and UDP headers included, except the last one of a frame, or of each part of a
+ * multipart frame, which may be smaller. */
+
+static void
+_count_data_packet (ArvGvStreamThreadData *thread_data,
+		    ArvGvStreamFrameData *frame,
+		    size_t packet_size)
+{
+	frame->n_data_packets++;
+
+	if (packet_size + ARV_GVSP_PACKET_UDP_OVERHEAD >= thread_data->scps_packet_size)
+		frame->n_full_size_data_packets++;
+}
+
+static gboolean
+_expects_full_size_data_packet (ArvGvStreamThreadData *thread_data,
+				ArvGvStreamFrameData *frame)
+{
+	if (frame->buffer->priv->payload_type == ARV_BUFFER_PAYLOAD_TYPE_MULTIPART) {
+		size_t overhead = ARV_GVSP_MULTIPART_PACKET_PROTOCOL_OVERHEAD (frame->extended_ids);
+		size_t block_size;
+		guint i;
+
+		if (thread_data->scps_packet_size <= overhead)
+			return FALSE;
+
+		/* Part sizes are known from the leader */
+		block_size = thread_data->scps_packet_size - overhead;
+		for (i = 0; i < frame->buffer->priv->n_parts; i++)
+			if (frame->buffer->priv->parts[i].size >= block_size)
+				return TRUE;
+
+		return FALSE;
+	}
+
+	/* Leader, at least two data packets, trailer */
+	return frame->n_packets > 3;
+}
+
+/* None of the full size data packets of a frame were received, only its small leader and trailer packets, and maybe
+ * its last data packet, if small too: the usual symptom of data packets larger than the MTU of the host interface or of
+ * the network, which drop them. The frame must be over, its trailer received. */
+
+static gboolean
+_is_leader_trailer_only_failure (ArvGvStreamThreadData *thread_data,
+				 ArvGvStreamFrameData *frame)
+{
+	if (frame->buffer->priv->status == ARV_BUFFER_STATUS_SUCCESS ||
+	    frame->buffer->priv->status == ARV_BUFFER_STATUS_ABORTED ||
+	    !frame->leader_received || !frame->trailer_received ||
+	    frame->n_packets <= 2 ||
+	    frame->n_full_size_data_packets > 0)
+		return FALSE;
+
+	return frame->n_data_packets == 0 || _expects_full_size_data_packet (thread_data, frame);
+}
+
+static void
+_leader_trailer_only_failure (ArvGvStreamThreadData *thread_data,
+			      ArvGvStreamFrameData *frame,
+			      guint64 time_us)
+{
+	char received_string[64];
+	char mtu_string[32];
+	guint n_expected_data_packets;
+
+	thread_data->n_leader_trailer_only_failures++;
+
+	if (thread_data->n_leader_trailer_only_failures > 1 &&
+	    time_us - thread_data->leader_trailer_only_warning_time_us <
+	    ARV_GV_STREAM_LEADER_TRAILER_ONLY_WARNING_PERIOD_US)
+		return;
+
+	thread_data->leader_trailer_only_warning_time_us = time_us;
+
+	if (frame->n_data_packets > 0)
+		g_snprintf (received_string, sizeof (received_string),
+			    "leader, the trailer and %u smaller data packet(s)", frame->n_data_packets);
+	else
+		g_strlcpy (received_string, "leader and trailer", sizeof (received_string));
+
+	if (thread_data->interface_mtu > 0)
+		g_snprintf (mtu_string, sizeof (mtu_string), "%u bytes", thread_data->interface_mtu);
+	else
+		g_strlcpy (mtu_string, "unknown", sizeof (mtu_string));
+
+	n_expected_data_packets = frame->n_packets - 2;
+
+	arv_warning_stream ("[GvStream::close_frame] Only the %s of frame %" G_GUINT64_FORMAT
+			    " were received, %u of its %u data packets were lost (%" G_GUINT64_FORMAT " such frame(s)"
+			    " so far). Packet size is %u bytes, interface MTU is %s: data packets larger than the MTU"
+			    " of the host interface, or of the network, are dropped.",
+			    received_string, frame->frame_id,
+			    n_expected_data_packets - MIN (frame->n_data_packets, n_expected_data_packets),
+			    n_expected_data_packets, thread_data->n_leader_trailer_only_failures,
+			    thread_data->scps_packet_size, mtu_string);
+}
+
 static void
 _close_frame (ArvGvStreamThreadData *thread_data,
               guint64 time_us,
@@ -765,6 +872,9 @@ _close_frame (ArvGvStreamThreadData *thread_data,
 	if (frame->buffer->priv->status != ARV_BUFFER_STATUS_SUCCESS &&
 	    frame->buffer->priv->status != ARV_BUFFER_STATUS_ABORTED)
 		thread_data->n_missing_packets += (int) frame->n_packets - (frame->last_valid_packet + 1);
+
+	if (_is_leader_trailer_only_failure (thread_data, frame))
+		_leader_trailer_only_failure (thread_data, frame, time_us);
 
 	arv_stream_push_output_buffer (thread_data->stream, frame->buffer);
 	if (thread_data->callback != NULL)
@@ -831,8 +941,11 @@ _check_frame_completion (ArvGvStreamThreadData *thread_data,
 		if (can_close_frame &&
                     /* Do not timeout on the most recent frame if the LEADER packet is so far the ONLY
                      * valid packet received. This is needed by some devices sending the leader packet early, at
-                     * acquisition start. */
-                    (frame->frame_id != thread_data->last_frame_id || frame->last_valid_packet != 0) &&
+                     * acquisition start. Once its TRAILER packet is received, the frame is over: without this
+                     * timeout, the last frame of an acquisition, like a single triggered frame, would never be
+                     * output if its first data packet was lost. */
+                    (frame->frame_id != thread_data->last_frame_id || frame->last_valid_packet != 0 ||
+                     frame->trailer_received) &&
 		    time_us - frame->last_packet_time_us >= thread_data->frame_retention_us) {
 			frame->buffer->priv->status = ARV_BUFFER_STATUS_TIMEOUT;
 			arv_warning_stream_thread ("[GvStream::check_frame_completion] Timeout for frame %"
@@ -841,10 +954,10 @@ _check_frame_completion (ArvGvStreamThreadData *thread_data,
 #if 0
 			if (arv_debug_check (&arv_debug_category_stream_thread, ARV_DEBUG_LEVEL_LOG)) {
 				int i;
-				arv_debug_stream_thread ("frame_id          = %Lu", frame->frame_id);
+				arv_debug_stream_thread ("frame_id          = %" G_GUINT64_FORMAT, frame->frame_id);
 				arv_debug_stream_thread ("last_valid_packet = %d", frame->last_valid_packet);
 				for (i = 0; i < frame->n_packets; i++) {
-					arv_debug_stream_thread ("%d - time = %Lu%s", i,
+					arv_debug_stream_thread ("%d - time = %" G_GUINT64_FORMAT "%s", i,
 							       frame->packet_data[i].time_us,
 							       frame->packet_data[i].received ? " - OK" : "");
 				}
@@ -964,14 +1077,17 @@ _process_packet (ArvGvStreamThreadData *thread_data, const ArvGvspPacket *packet
                                         thread_data->n_transferred_bytes += packet_size;
                                         break;
                                 case ARV_GVSP_CONTENT_TYPE_PAYLOAD:
+                                        _count_data_packet (thread_data, frame, packet_size);
                                         _process_payload_block (thread_data, frame, packet, packet_size, packet_id);
                                         thread_data->n_transferred_bytes += packet_size;
                                         break;
                                 case ARV_GVSP_CONTENT_TYPE_MULTIPART:
+                                        _count_data_packet (thread_data, frame, packet_size);
                                         _process_multipart_block (thread_data, frame, packet, packet_size, packet_id);
                                         thread_data->n_transferred_bytes += packet_size;
                                         break;
                                 case ARV_GVSP_CONTENT_TYPE_TRAILER:
+                                        frame->trailer_received = TRUE;
                                         _process_data_trailer (thread_data, frame, packet_id);
                                         thread_data->n_transferred_bytes += packet_size;
                                         break;
@@ -1223,6 +1339,27 @@ typedef struct {
 	struct tpacket_hdr_v1 h1;
 } ArvGvStreamBlockDescriptor;
 
+/* A UDP datagram larger than the MTU of the network path reaches the packet socket in several IP fragments, and the
+ * socket filter only keeps the first one, which carries only the beginning of the GVSP packet. Like a capture shorter
+ * than its datagram, it is ignored: the GVSP packet counts as missing, and its frame can't complete without it. The
+ * warning is issued once per stream, in the stream category, like the leader and trailer only frames one. */
+
+static void
+_ignore_incomplete_datagram (ArvGvStreamThreadData *thread_data, size_t size)
+{
+	thread_data->n_ignored_packets++;
+	thread_data->n_ignored_bytes += size;
+
+	if (!thread_data->incomplete_datagram_warned) {
+		thread_data->incomplete_datagram_warned = TRUE;
+		arv_warning_stream ("[GvStream::loop] Incomplete UDP datagram ignored (IP fragment or"
+				    " truncated capture): the packet socket can't receive GVSP packets larger"
+				    " than the MTU of the network path. Packet size is %u bytes: lower it, or"
+				    " disable the packet socket.", thread_data->scps_packet_size);
+	} else
+		arv_debug_stream_thread ("[GvStream::loop] Incomplete UDP datagram ignored");
+}
+
 static void
 _ring_buffer_loop (ArvGvStreamThreadData *thread_data)
 {
@@ -1240,7 +1377,10 @@ _ring_buffer_loop (ArvGvStreamThreadData *thread_data)
 
 	arv_info_stream ("[GvStream::loop] Packet socket method");
 
-	fd = socket (PF_PACKET, SOCK_RAW, g_htons (ETH_P_ALL));
+	/* A packet socket created for a protocol immediately captures the frames of every interface. Without protocol, it
+	 * captures nothing until it is bound to one, once its filter is attached: the ring buffer only receives the
+	 * packets of the stream. */
+	fd = socket (PF_PACKET, SOCK_RAW, 0);
 	if (fd < 0) {
 		arv_warning_stream_thread ("[GvStream::loop] Failed to create AF_PACKET socket");
 		goto af_packet_error;
@@ -1275,6 +1415,9 @@ _ring_buffer_loop (ArvGvStreamThreadData *thread_data)
 	bytes = g_inet_address_to_bytes (thread_data->device_address);
 	device_address = g_ntohl (*((guint32 *) bytes));
 
+	_set_socket_filter (fd, device_address, thread_data->source_stream_port, interface_address, thread_data->stream_port);
+
+	/* Starts the capture */
 	local_address.sll_family   = AF_PACKET;
 	local_address.sll_protocol = g_htons(ETH_P_IP);
 	local_address.sll_ifindex  = _interface_index_from_address (interface_address);
@@ -1285,8 +1428,6 @@ _ring_buffer_loop (ArvGvStreamThreadData *thread_data)
 		arv_warning_stream_thread ("[GvStream::loop] Failed to bind packet socket");
 		goto bind_error;
 	}
-
-	_set_socket_filter (fd, device_address, thread_data->source_stream_port, interface_address, thread_data->stream_port);
 
 	poll_fd[0].fd = fd;
 	poll_fd[0].events =  G_IO_IN;
@@ -1331,17 +1472,22 @@ _ring_buffer_loop (ArvGvStreamThreadData *thread_data)
 			header = (void *) (((char *) descriptor) + descriptor->h1.offset_to_first_pkt);
 
 			for (i = 0; i < descriptor->h1.num_pkts; i++) {
-				const struct iphdr *ip;
 				const ArvGvspPacket *packet;
 				size_t size;
+				gboolean is_incomplete;
 
-				ip = (void *) (((char *) header) + header->tp_mac + ETH_HLEN);
-				packet = (void *) (((char *) ip) + sizeof (struct iphdr) + sizeof (struct udphdr));
-				size = g_ntohs (ip->tot_len) -  sizeof (struct iphdr) - sizeof (struct udphdr);
+				packet = arv_network_ethernet_frame_get_udp_payload (((const char *) header) +
+										     header->tp_mac,
+										     header->tp_snaplen, &size,
+										     &is_incomplete);
+				if (G_LIKELY (packet != NULL)) {
+					frame = _process_packet (thread_data, packet, size, time_us);
 
-				frame = _process_packet (thread_data, packet, size, time_us);
-
-				_check_frame_completion (thread_data, time_us, frame);
+					_check_frame_completion (thread_data, time_us, frame);
+				} else if (is_incomplete)
+					_ignore_incomplete_datagram (thread_data, header->tp_snaplen);
+				/* Otherwise not a UDP datagram, thus not a packet of the stream, that the socket filter
+				 * should have rejected */
 
 				header = (void *) (((char *) header) + header->tp_next_offset);
 			}
@@ -1658,6 +1804,25 @@ arv_gv_stream_constructed (GObject *object)
 	device_address = g_inet_socket_address_get_address
                 (G_INET_SOCKET_ADDRESS (arv_gv_device_get_device_address (priv->gv_device)));
 
+	priv->thread_data->interface_mtu = arv_network_get_interface_mtu_by_address (interface_address);
+	if (priv->thread_data->interface_mtu > 0)
+		arv_info_stream ("[GvStream::stream_new] Interface MTU = %u bytes", priv->thread_data->interface_mtu);
+	else
+		arv_info_stream ("[GvStream::stream_new] Interface MTU unknown");
+
+#if ARAVIS_HAS_PACKET_SOCKET
+	/* The packet socket captures the traffic of the network interface owning the interface address, but the traffic
+	 * of a device running on this host, like a fake camera, goes through the loopback interface, whatever the
+	 * interface address. */
+	if (priv->thread_data->use_packet_socket &&
+	    !g_inet_address_get_is_loopback (interface_address) &&
+	    arv_network_is_host_address (device_address)) {
+		arv_info_stream ("[GvStream::stream_new] Device on this host, reached through the loopback interface:"
+				 " packet socket not used");
+		priv->thread_data->use_packet_socket = FALSE;
+	}
+#endif
+
 	priv->thread_data->socket = g_socket_new (G_SOCKET_FAMILY_IPV4, G_SOCKET_TYPE_DATAGRAM, G_SOCKET_PROTOCOL_UDP, NULL);
 	priv->thread_data->device_address = g_object_ref (device_address);
 	priv->thread_data->interface_address = g_object_ref (interface_address);
@@ -1672,10 +1837,15 @@ arv_gv_stream_constructed (GObject *object)
 	g_object_unref (local_address);
 
 	address_bytes = g_inet_address_to_bytes (interface_address);
+	/* The channel now sends to this stream, until a newer one configures it. The stream channel lock keeps a former
+	 * stream, destroyed meanwhile in another thread, from disabling the channel after these writes. */
+	arv_gv_device_lock_stream_channels (priv->gv_device);
 	arv_device_set_integer_feature_value (ARV_DEVICE (priv->gv_device),
                                               "ArvGevSCDA", g_htonl (*((guint32 *) address_bytes)), NULL);
 	arv_device_set_integer_feature_value (ARV_DEVICE (priv->gv_device),
                                               "ArvGevSCPHostPort", priv->thread_data->stream_port, NULL);
+	arv_gv_device_take_stream_channel (priv->gv_device, priv->stream_channel, gv_stream);
+	arv_gv_device_unlock_stream_channels (priv->gv_device);
 	priv->thread_data->source_stream_port = arv_device_get_integer_feature_value (ARV_DEVICE (priv->gv_device),
                                                                                       "ArvGevSCSP", NULL);
 
@@ -1718,6 +1888,8 @@ arv_gv_stream_constructed (GObject *object)
                                  G_TYPE_UINT64, &priv->thread_data->n_transferred_bytes);
         arv_stream_declare_info (ARV_STREAM (gv_stream), "n_ignored_bytes",
                                  G_TYPE_UINT64, &priv->thread_data->n_ignored_bytes);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "n_leader_trailer_only_failures",
+                                 G_TYPE_UINT64, &priv->thread_data->n_leader_trailer_only_failures);
 }
 
 static void
@@ -1729,13 +1901,28 @@ arv_gv_stream_finalize (GObject *object)
         if (priv->thread != NULL)
                 arv_gv_stream_stop_acquisition (ARV_STREAM (object), NULL);
 
-        /* Stop the stream channel. We use a raw register write here, as the Genicam based access rely on
-         * ArvGevStreamSelector state, and we don't want to change it here. */
-        arv_device_write_register(ARV_DEVICE(priv->gv_device), 0xd00 + 0x40 * priv->stream_channel, 0x0000, &error);
+        /* Stop the stream channel, unless a newer stream of the device configured it since, and may be using it. We
+         * use a raw register write here, as the Genicam based access rely on ArvGevStreamSelector state, and we don't
+         * want to change it here. The stream channel lock keeps a newer stream from configuring the channel between
+         * the ownership check and the write. */
+        if (priv->gv_device != NULL) {
+                arv_gv_device_lock_stream_channels (priv->gv_device);
 
-        if (error != NULL) {
-                arv_warning_stream ("Failed to stop stream channel %d (%s)", priv->stream_channel, error->message);
-                g_clear_error(&error);
+                if (arv_gv_device_release_stream_channel (priv->gv_device, priv->stream_channel, object)) {
+                        arv_device_write_register(ARV_DEVICE(priv->gv_device), 0xd00 + 0x40 * priv->stream_channel,
+                                                  0x0000, &error);
+
+                        if (error != NULL) {
+                                arv_warning_stream ("Failed to stop stream channel %u (%s)", priv->stream_channel,
+                                                    error->message);
+                                g_clear_error(&error);
+                        }
+                } else {
+                        arv_info_stream ("[GvStream::finalize] Stream channel %u left to a newer stream",
+                                         priv->stream_channel);
+                }
+
+                arv_gv_device_unlock_stream_channels (priv->gv_device);
         }
 
 	if (priv->thread_data != NULL) {
@@ -1789,6 +1976,9 @@ arv_gv_stream_finalize (GObject *object)
 				  thread_data->n_transferred_bytes);
 		arv_info_stream ("[GvStream::finalize] n_ignored_bytes        = %" G_GUINT64_FORMAT,
 				  thread_data->n_ignored_bytes);
+
+		arv_info_stream ("[GvStream::finalize] n_leader_trailer_only_failures = %" G_GUINT64_FORMAT,
+				  thread_data->n_leader_trailer_only_failures);
 
 		g_clear_object (&thread_data->device_address);
 		g_clear_object (&thread_data->interface_address);

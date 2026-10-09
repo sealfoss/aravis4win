@@ -40,23 +40,64 @@ typedef struct {
 
 G_DEFINE_ABSTRACT_TYPE_WITH_CODE (ArvInterface, arv_interface, G_TYPE_OBJECT, G_ADD_PRIVATE (ArvInterface))
 
+/* See arv_interface_get_device_list_changes () */
+static gint arv_interface_device_list_changes = 0;
+
 static void
-arv_interface_clear_device_ids (ArvInterface *iface)
+arv_interface_free_device_ids (GArray *device_ids)
 {
-	ArvInterfacePrivate *priv = arv_interface_get_instance_private (iface);
 	unsigned int i;
 
-	for (i = 0; i < priv->device_ids->len; i++) {
-		g_free (g_array_index (priv->device_ids, ArvInterfaceDeviceIds *, i)->device);
-		g_free (g_array_index (priv->device_ids, ArvInterfaceDeviceIds *, i)->physical);
-		g_free (g_array_index (priv->device_ids, ArvInterfaceDeviceIds *, i)->address);
-		g_free (g_array_index (priv->device_ids, ArvInterfaceDeviceIds *, i)->vendor);
-		g_free (g_array_index (priv->device_ids, ArvInterfaceDeviceIds *, i)->manufacturer_info);
-		g_free (g_array_index (priv->device_ids, ArvInterfaceDeviceIds *, i)->model);
-		g_free (g_array_index (priv->device_ids, ArvInterfaceDeviceIds *, i)->serial_nbr);
-		g_free (g_array_index (priv->device_ids, ArvInterfaceDeviceIds *, i));
+	for (i = 0; i < device_ids->len; i++) {
+		g_free (g_array_index (device_ids, ArvInterfaceDeviceIds *, i)->device);
+		g_free (g_array_index (device_ids, ArvInterfaceDeviceIds *, i)->physical);
+		g_free (g_array_index (device_ids, ArvInterfaceDeviceIds *, i)->address);
+		g_free (g_array_index (device_ids, ArvInterfaceDeviceIds *, i)->vendor);
+		g_free (g_array_index (device_ids, ArvInterfaceDeviceIds *, i)->manufacturer_info);
+		g_free (g_array_index (device_ids, ArvInterfaceDeviceIds *, i)->model);
+		g_free (g_array_index (device_ids, ArvInterfaceDeviceIds *, i)->serial_nbr);
+		g_free (g_array_index (device_ids, ArvInterfaceDeviceIds *, i));
 	}
-	g_array_set_size (priv->device_ids, 0);
+	g_array_free (device_ids, TRUE);
+}
+
+/* Whether two device lists tell the same, device by device */
+
+static gboolean
+arv_interface_device_ids_equal (GArray *a, GArray *b)
+{
+	unsigned int i;
+
+	if (a->len != b->len)
+		return FALSE;
+
+	for (i = 0; i < a->len; i++) {
+		ArvInterfaceDeviceIds *ids_a = g_array_index (a, ArvInterfaceDeviceIds *, i);
+		ArvInterfaceDeviceIds *ids_b = g_array_index (b, ArvInterfaceDeviceIds *, i);
+
+		if (g_strcmp0 (ids_a->device, ids_b->device) != 0 ||
+		    g_strcmp0 (ids_a->physical, ids_b->physical) != 0 ||
+		    g_strcmp0 (ids_a->address, ids_b->address) != 0 ||
+		    g_strcmp0 (ids_a->vendor, ids_b->vendor) != 0 ||
+		    g_strcmp0 (ids_a->manufacturer_info, ids_b->manufacturer_info) != 0 ||
+		    g_strcmp0 (ids_a->model, ids_b->model) != 0 ||
+		    g_strcmp0 (ids_a->serial_nbr, ids_b->serial_nbr) != 0 ||
+		    g_strcmp0 (ids_a->protocol, ids_b->protocol) != 0)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+/* The number of updates of the device list of an interface, any interface, that changed the list: a device came,
+ * went, moved to another index, or tells other identifiers, names or addresses. An update that finds the same devices
+ * doesn't count, whoever runs it. It never decreases. arv_get_device_list_generation () adds it to its count of the
+ * changes of the interface selection. */
+
+guint
+arv_interface_get_device_list_changes (void)
+{
+	return (guint) g_atomic_int_get (&arv_interface_device_list_changes);
 }
 
 static gint
@@ -84,13 +125,22 @@ void
 arv_interface_update_device_list (ArvInterface *iface)
 {
 	ArvInterfacePrivate *priv = arv_interface_get_instance_private (iface);
+	GArray *previous_device_ids;
+
 	g_return_if_fail (ARV_IS_INTERFACE (iface));
 
-	arv_interface_clear_device_ids (iface);
+	/* Kept until the new list is complete, to tell whether the list changed */
+	previous_device_ids = priv->device_ids;
+	priv->device_ids = g_array_new (FALSE, TRUE, sizeof (ArvInterfaceDeviceIds *));
 
 	ARV_INTERFACE_GET_CLASS (iface)->update_device_list (iface, priv->device_ids);
 
 	g_array_sort (priv->device_ids, (GCompareFunc) _compare_device_ids);
+
+	if (!arv_interface_device_ids_equal (previous_device_ids, priv->device_ids))
+		g_atomic_int_inc (&arv_interface_device_list_changes);
+
+	arv_interface_free_device_ids (previous_device_ids);
 }
 
 void
@@ -407,8 +457,7 @@ arv_interface_finalize (GObject *object)
 
 	G_OBJECT_CLASS (arv_interface_parent_class)->finalize (object);
 
-	arv_interface_clear_device_ids (iface);
-	g_array_free (priv->device_ids, TRUE);
+	arv_interface_free_device_ids (priv->device_ids);
 	priv->device_ids = NULL;
 }
 

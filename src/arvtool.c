@@ -22,6 +22,7 @@
 
 #include <arvdebugprivate.h>
 #include <arvmiscprivate.h>
+#include <arvsystemprivate.h>
 #include <arv.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,7 @@ static gboolean arv_option_show_time = FALSE;
 static gboolean arv_option_show_version = FALSE;
 static char *arv_option_gv_port_range = NULL;
 static char *arv_option_gv_discovery_interface = NULL;
+static gboolean arv_option_gentl = FALSE;
 
 static const GOptionEntry arv_option_entries[] =
 {
@@ -87,6 +89,11 @@ static const GOptionEntry arv_option_entries[] =
 		"gv-discovery-interface",               '\0', 0, G_OPTION_ARG_STRING,
 		&arv_option_gv_discovery_interface,     "Discovery using the interface",
 		"<interface>"
+	},
+	{
+		"gentl",			'\0', 0, G_OPTION_ARG_NONE,
+		&arv_option_gentl,		"Enable the GenTL interface",
+		NULL
 	},
 	{
 		"debug", 			'd', 0, G_OPTION_ARG_STRING,
@@ -811,6 +818,9 @@ main (int argc, char **argv)
 	if (arv_option_gv_discovery_interface)
 		arv_gv_interface_set_discovery_interface_name (arv_option_gv_discovery_interface);
 
+	if (arv_option_gentl)
+		arv_enable_interface ("GenTL");
+
 	device_id = arv_option_device_address != NULL ?
                 arv_option_device_address :
                 (is_glob_pattern ? NULL : arv_option_device_selection);
@@ -881,10 +891,16 @@ main (int argc, char **argv)
         }
 
         if (n_found_devices < 1) {
+                /* Same text as the device not found error of arv_open_device () */
+                char *open_errors = arv_dup_device_open_errors ();
+
                 if (n_devices > 0)
                         fprintf (stderr, "No matching device found (%d filtered out)\n", n_devices);
                 else
                         fprintf (stderr, "No device found\n");
+                if (open_errors != NULL)
+                        fprintf (stderr, "%s\n", open_errors);
+                g_free (open_errors);
         }
 
         g_regex_unref (regex);

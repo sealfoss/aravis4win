@@ -49,6 +49,8 @@ typedef struct {
 void            arv_interface_set_flags         (ArvInterface *iface, int flags);
 int             arv_interface_get_flags         (ArvInterface *iface);
 
+guint           arv_interface_get_device_list_changes (void);
+
 G_END_DECLS
 
 #endif

@@ -36,14 +36,34 @@ static GC_ERROR
 gentl_to_buf__cam_string (DEV_HANDLE hDevice, const char* (*func)(ArvCamera*,GError**),
                           INFO_DATATYPE *piType, void *pBuffer, size_t *piSize)
 {
+	GError *error = NULL;
 	const char* n;
 
-	n=func(hDevice,&gentl_err);
+	n=func(hDevice,&error);
 	if(n==NULL)
-                return GC_ERR_IO;
+                return gentl_take_error (GC_ERR_IO, error);
 
 	return gentl_to_buf(INFO_DATATYPE_STRING,pBuffer,n,piSize,piType);
 };
+
+/* An Aravis device has one stream, a GigE Vision device may have more channels */
+
+static GC_ERROR
+_get_n_data_streams (DEV_HANDLE hDevice, guint *n_data_streams)
+{
+	GError *error = NULL;
+
+	if (!arv_camera_is_gv_device (hDevice)) {
+		*n_data_streams = 1;
+		return GC_ERR_SUCCESS;
+	}
+
+	*n_data_streams = arv_camera_gv_get_n_stream_channels (hDevice, &error);
+	if (error != NULL)
+		return gentl_take_error (GC_ERR_IO, error);
+
+	return GC_ERR_SUCCESS;
+}
 
 GC_ERROR
 DevGetPort (DEV_HANDLE hDevice, PORT_HANDLE *phRemoteDevice)
@@ -59,27 +79,23 @@ DevGetPort (DEV_HANDLE hDevice, PORT_HANDLE *phRemoteDevice)
 GC_ERROR
 DevGetNumDataStreams (DEV_HANDLE hDevice, uint32_t *piNumDataStreams)
 {
-	GError* err;
+	GC_ERROR error;
+	guint n_data_streams;
 
 	_DEV_CHECK_HANDLE
 	arv_trace_gentl("%s (hDevice=%s[%p])",__FUNCTION__,G_OBJECT_TYPE_NAME(hDevice),hDevice);
 
 	if(piNumDataStreams==NULL)
                 return GC_ERR_INVALID_PARAMETER;
-	if(!arv_camera_is_gv_device(hDevice))
-                arv_warning_gentl("%s: not a GV device: expect trouble.",__FUNCTION__);
 
-        /* GenTL provides no way to clear last error; so there would be a warning here "CRTITICAL **:
-         * arv_gc_integer_get_value: assertion 'error == NULL || *error == NULL' failed" — which only means that a
-         * previous error is stored in gentl_error (as required by the specification). In this case,
-         * arv_camera_gv_get_n_stream_channels will report failure, that's why we use a separate error pointer just for
-         * the call, and store it in gentl_err if it fails.  */
-	err=NULL;
-	*piNumDataStreams=arv_camera_gv_get_n_stream_channels(hDevice,&err);
-	if(err!=NULL) {
-                *gentl_err=*err; return GC_ERR_IO;
-        }
-	arv_trace_gentl("   (returning %d)",*piNumDataStreams);
+        /* GenTL provides no way to clear last error, which is kept in gentl_err as required by the specification:
+         * the Aravis calls use their own error. */
+	error = _get_n_data_streams (hDevice, &n_data_streams);
+	if (error != GC_ERR_SUCCESS)
+		return error;
+
+	*piNumDataStreams = n_data_streams;
+	arv_trace_gentl("   (returning %u)",*piNumDataStreams);
 
 	return GC_ERR_SUCCESS;
 }
@@ -87,25 +103,22 @@ DevGetNumDataStreams (DEV_HANDLE hDevice, uint32_t *piNumDataStreams)
 GC_ERROR
 DevGetDataStreamID (DEV_HANDLE hDevice, uint32_t iIndex, char *sDataStreamID, size_t *piSize)
 {
-	GError* err = NULL;
-	gint chan;
-	char buf[4];
+	GC_ERROR error;
+	guint chan;
+	char buf[16];
 
 	_DEV_CHECK_HANDLE
-	arv_trace_gentl("%s (hDevice=%s[%p], iIndex=%d)",__FUNCTION__,G_OBJECT_TYPE_NAME(hDevice),hDevice,iIndex);
+	arv_trace_gentl("%s (hDevice=%s[%p], iIndex=%u)",__FUNCTION__,G_OBJECT_TYPE_NAME(hDevice),hDevice,iIndex);
 
-	chan = arv_camera_gv_get_n_stream_channels(hDevice,&err);
-
-	if (err != NULL) {
-                *gentl_err=*err;
-                return GC_ERR_IO;
-        }
+	error = _get_n_data_streams (hDevice, &chan);
+	if (error != GC_ERR_SUCCESS)
+		return error;
 	if(chan==0)
                 return GC_ERR_NOT_IMPLEMENTED;
 	if (iIndex >= chan)
                 return GC_ERR_INVALID_INDEX;
 
-	g_snprintf(buf, sizeof(buf), "%d", iIndex);
+	g_snprintf(buf, sizeof(buf), "%u", iIndex);
 
 	/* GenTL identifies streams by strings, so we just use 0-based channel index */
 	return gentl_to_buf(INFO_DATATYPE_STRING,sDataStreamID,buf,piSize,NULL);
@@ -134,7 +147,13 @@ DevGetInfo ( DEV_HANDLE hDevice, DEVICE_INFO_CMD iInfoCmd, INFO_DATATYPE *piType
 GC_ERROR
 DevClose (DEV_HANDLE hDevice)
 {
-        GENTL_NYI;
+	_DEV_CHECK_HANDLE;
+	arv_trace_gentl("%s (hDevice=%s[%p])",__FUNCTION__,G_OBJECT_TYPE_NAME(hDevice),hDevice);
+
+	/* The camera created by IFOpenDevice */
+	g_object_unref (hDevice);
+
+	return GC_ERR_SUCCESS;
 }
 
 /* GenTL v1.4 */

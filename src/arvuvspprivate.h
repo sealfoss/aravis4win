@@ -351,6 +351,17 @@ arv_uvsp_packet_get_gendc_partdatapffset(unsigned char *packet){
 }
 
 static inline guint64
+arv_uvsp_packet_get_gendc_partdatasize(unsigned char *packet){
+	ArvUvspGenDCPartHeader *gendc_part_header;
+	if (packet == NULL){
+	        return 0;
+	}
+
+	gendc_part_header = (ArvUvspGenDCPartHeader*)packet;
+	return gendc_part_header->datasize;
+}
+
+static inline guint64
 arv_uvsp_packet_get_gendc_componentpixelformat(unsigned char *packet){
 	ArvUvspGenDCComponentHeader* gendc_component_header;
 

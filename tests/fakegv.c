@@ -3,7 +3,27 @@
 #include <glib.h>
 #include <arv.h>
 
+static ArvGvFakeCamera *simulator = NULL;
 static ArvCamera *camera = NULL;
+
+/* The fake camera listens on 127.0.0.1, but it also answers the discovery broadcasts sent through the other network
+ * interfaces of the host. Whichever answer comes first, or last, it must be reached through the loopback interface,
+ * which owns its subnet, as its traffic goes through it anyway. */
+
+static void
+assert_reached_through_loopback (ArvCamera *gv_camera)
+{
+        ArvDevice *device;
+        GSocketAddress *interface_address;
+
+        device = arv_camera_get_device (gv_camera);
+        g_assert (ARV_IS_GV_DEVICE (device));
+
+        interface_address = arv_gv_device_get_interface_address (ARV_GV_DEVICE (device));
+        g_assert (G_IS_INET_SOCKET_ADDRESS (interface_address));
+        g_assert_true (g_inet_address_get_is_loopback
+                       (g_inet_socket_address_get_address (G_INET_SOCKET_ADDRESS (interface_address))));
+}
 
 static void
 discovery_test (void)
@@ -12,6 +32,9 @@ discovery_test (void)
         char *discovery_iface;
         int n_devices;
         int i;
+
+        /* Opened in main() by name, through a discovery returning the first answer */
+        assert_reached_through_loopback (camera);
 
         arv_gv_interface_set_discovery_interface_name("not-an-iface");
 
@@ -34,6 +57,8 @@ discovery_test (void)
 
         test_camera = arv_camera_new ("Aravis-GVTest", NULL);
         g_assert (ARV_IS_CAMERA(test_camera));
+        /* Opened from the device list, filled with the last answer */
+        assert_reached_through_loopback (test_camera);
         g_clear_object (&test_camera);
 
         n_devices = arv_get_n_devices ();
@@ -264,10 +289,156 @@ dynamic_roi_test (void)
 	g_clear_object (&stream);
 }
 
+/* A stream disables its stream channel when it is destroyed, unless a newer stream of the device configured the
+ * channel since: the channel goes on sending to the newer stream. An application may destroy a stream after creating
+ * the next one, for example one that still holds the former stream of aravissrc, read from its 'stream' property, when
+ * the element creates a new stream at a caps change. */
+
+static gint64
+get_stream_channel_port (ArvDevice *device)
+{
+	GError *error = NULL;
+	gint64 port;
+
+	port = arv_device_get_integer_feature_value (device, "ArvGevSCPHostPort", &error);
+	g_assert_no_error (error);
+
+	return port;
+}
+
+static void
+stream_channel_test (void)
+{
+	ArvDevice *device = arv_camera_get_device (camera);
+	ArvStream *former_stream;
+	ArvStream *stream;
+	ArvBuffer *buffer;
+	GError *error = NULL;
+	gint64 former_port;
+	gint64 port;
+	size_t payload;
+	unsigned i;
+
+	former_stream = arv_camera_create_stream (camera, NULL, NULL, NULL, &error);
+	g_assert_no_error (error);
+	g_assert_true (ARV_IS_GV_STREAM (former_stream));
+	former_port = get_stream_channel_port (device);
+	g_assert_cmpint (former_port, !=, 0);
+
+	stream = arv_camera_create_stream (camera, NULL, NULL, NULL, &error);
+	g_assert_no_error (error);
+	g_assert_true (ARV_IS_GV_STREAM (stream));
+	port = get_stream_channel_port (device);
+	g_assert_cmpint (port, !=, 0);
+	g_assert_cmpint (port, !=, former_port);
+
+	g_clear_object (&former_stream);
+	g_assert_cmpint (get_stream_channel_port (device), ==, port);
+
+	/* Frames reach the newer stream */
+	payload = arv_camera_get_payload (camera, NULL);
+	for (i = 0; i < N_BUFFERS; i++)
+		arv_stream_push_buffer (stream, arv_buffer_new (payload, NULL));
+	arv_camera_start_acquisition (camera, &error);
+	g_assert_no_error (error);
+	buffer = arv_stream_timeout_pop_buffer (stream, 5 * G_USEC_PER_SEC);
+	g_assert_true (ARV_IS_BUFFER (buffer));
+	g_object_unref (buffer);
+	arv_camera_stop_acquisition (camera, &error);
+	g_assert_no_error (error);
+
+	/* The last stream disables the channel */
+	g_clear_object (&stream);
+	g_assert_cmpint (get_stream_channel_port (device), ==, 0);
+}
+
+/* The former stream may also be destroyed in another thread while the next one is being created. Here it is destroyed
+ * as soon as the fake camera has the port of the next stream, before that stream took the channel over: the channel
+ * must still send to the next stream once it is created. */
+
+#define N_CONCURRENT_STREAMS	20
+
+typedef struct {
+	ArvFakeCamera *fake_camera;
+	ArvStream *former_stream;
+	guint16 former_port;
+	gint stream_created;
+} DestroyFormerStreamData;
+
+/* Read from the memory of the fake camera, without a GVCP transaction */
+
+static guint16
+get_fake_camera_stream_port (ArvFakeCamera *fake_camera)
+{
+	GSocketAddress *address;
+	guint16 port;
+
+	address = arv_fake_camera_get_stream_address (fake_camera);
+	port = g_inet_socket_address_get_port (G_INET_SOCKET_ADDRESS (address));
+	g_object_unref (address);
+
+	return port;
+}
+
+static gpointer
+destroy_former_stream (gpointer user_data)
+{
+	DestroyFormerStreamData *data = user_data;
+
+	/* Busy wait, as the next stream takes the channel over as soon as the fake camera acknowledges its port write */
+	while (get_fake_camera_stream_port (data->fake_camera) == data->former_port &&
+	       !g_atomic_int_get (&data->stream_created))
+		;
+
+	g_object_unref (data->former_stream);
+
+	return NULL;
+}
+
+static void
+stream_channel_concurrent_test (void)
+{
+	ArvDevice *device = arv_camera_get_device (camera);
+	ArvFakeCamera *fake_camera = arv_gv_fake_camera_get_fake_camera (simulator);
+	ArvStream *former_stream;
+	GError *error = NULL;
+	unsigned i;
+
+	former_stream = arv_camera_create_stream (camera, NULL, NULL, NULL, &error);
+	g_assert_no_error (error);
+	g_assert_true (ARV_IS_GV_STREAM (former_stream));
+
+	for (i = 0; i < N_CONCURRENT_STREAMS; i++) {
+		DestroyFormerStreamData data;
+		ArvStream *stream;
+		GThread *thread;
+
+		data.fake_camera = fake_camera;
+		data.former_stream = former_stream;
+		data.former_port = arv_gv_stream_get_port (ARV_GV_STREAM (former_stream));
+		data.stream_created = FALSE;
+		g_assert_cmpuint (get_fake_camera_stream_port (fake_camera), ==, data.former_port);
+
+		thread = g_thread_new ("destroy-former-stream", destroy_former_stream, &data);
+		stream = arv_camera_create_stream (camera, NULL, NULL, NULL, &error);
+		g_atomic_int_set (&data.stream_created, TRUE);
+		g_thread_join (thread);
+		g_assert_no_error (error);
+		g_assert_true (ARV_IS_GV_STREAM (stream));
+
+		g_assert_cmpint (get_stream_channel_port (device), ==, arv_gv_stream_get_port (ARV_GV_STREAM (stream)));
+
+		former_stream = stream;
+	}
+
+	/* The last stream disables the channel */
+	g_clear_object (&former_stream);
+	g_assert_cmpint (get_stream_channel_port (device), ==, 0);
+}
+
 int
 main (int argc, char *argv[])
 {
-	ArvGvFakeCamera *simulator;
 	int result;
 
 	g_test_init (&argc, &argv, NULL);
@@ -287,6 +458,8 @@ main (int argc, char *argv[])
 	g_test_add_func ("/fakegv/acquisition", acquisition_test);
 	g_test_add_func ("/fakegv/stream", stream_test);
 	g_test_add_func ("/fakegv/dynamic_roi", dynamic_roi_test);
+	g_test_add_func ("/fakegv/stream-channel", stream_channel_test);
+	g_test_add_func ("/fakegv/stream-channel-concurrent", stream_channel_concurrent_test);
 
 	result = g_test_run();
 

@@ -34,6 +34,7 @@
 #include <arvstr.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 /* ArvGenTLnterface implementation */
 
@@ -64,6 +65,7 @@ arv_gentl_interface_device_infos_new (ArvGenTLSystem *system,
         ArvGenTLInterfaceDeviceInfos *infos;
 
 	g_return_val_if_fail (system != NULL, NULL);
+	g_return_val_if_fail (tl_vendor != NULL, NULL);
 	g_return_val_if_fail (interface != NULL, NULL);
 	g_return_val_if_fail (guid != NULL, NULL);
 	g_return_val_if_fail (vendor != NULL, NULL);
@@ -71,7 +73,7 @@ arv_gentl_interface_device_infos_new (ArvGenTLSystem *system,
 	g_return_val_if_fail (serial_nbr != NULL, NULL);
 
 	infos = g_new (ArvGenTLInterfaceDeviceInfos, 1);
-	infos->system  = system;
+	infos->system  = g_object_ref (system);
 	infos->interface = g_strdup(interface);
         infos->guid = g_strdup (guid);
 	infos->id = g_strdup_printf ("%s-%s-%s-%s", tl_vendor, vendor, model, serial_nbr);
@@ -107,7 +109,7 @@ arv_gentl_interface_device_infos_unref (ArvGenTLInterfaceDeviceInfos *infos)
 	g_return_if_fail (g_atomic_int_get (&infos->ref_count) > 0);
 
 	if (g_atomic_int_dec_and_test (&infos->ref_count)) {
-		infos->system = NULL;
+		g_clear_object (&infos->system);
 		g_clear_pointer (&infos->interface, g_free);
 		g_clear_pointer (&infos->guid, g_free);
 		g_clear_pointer (&infos->id, g_free);
@@ -137,21 +139,29 @@ struct _ArvGenTLInterfaceClass {
 
 G_DEFINE_TYPE_WITH_CODE (ArvGenTLInterface, arv_gentl_interface, ARV_TYPE_INTERFACE, G_ADD_PRIVATE (ArvGenTLInterface))
 
+/* The string getters return NULL if the producer can't provide the information. One byte is added to the allocated
+ * size, for producers not counting the string terminator. */
+
 static char *
 _gentl_get_tl_info_str (ArvGenTLModule *gentl, TL_HANDLE handle, TL_INFO_CMD info_cmd)
 {
 	GC_ERROR error;
 	INFO_DATATYPE type;
-	size_t size;
+	size_t size = 0;
 	char *value = NULL;
 
 	error = gentl->TLGetInfo (handle, info_cmd, &type, NULL, &size);
-	if (error == GC_ERR_SUCCESS) {
-		value = g_malloc0(size);
-		gentl->TLGetInfo (handle, info_cmd, &type, value, &size);
-	} else {
-		arv_warning_interface("_gentl_get_tl_info_str: error %d", error);
-        }
+	if (error == GC_ERR_SUCCESS && size > 0) {
+		value = g_malloc0(size + 1);
+		error = gentl->TLGetInfo (handle, info_cmd, &type, value, &size);
+		if (error != GC_ERR_SUCCESS)
+			g_clear_pointer (&value, g_free);
+	}
+
+	if (value == NULL)
+		arv_info_interface("_gentl_get_tl_info_str: no info %d (%s)", info_cmd,
+				   arv_gentl_gc_error_to_string (error));
+
 	return value;
 }
 
@@ -161,13 +171,21 @@ _gentl_get_info_str(GC_ERROR(*func)(void*, const char *, int32_t, int32_t*, void
 {
 	GC_ERROR error;
 	INFO_DATATYPE type;
-	size_t size;
+	size_t size = 0;
 	char *value = NULL;
+
 	error = func(interface, device, info_cmd, &type, NULL, &size);
-	if (error == GC_ERR_SUCCESS) {
-		value = g_malloc0(size);
-		func(interface, device, info_cmd, &type, value, &size);
+	if (error == GC_ERR_SUCCESS && size > 0) {
+		value = g_malloc0(size + 1);
+		error = func(interface, device, info_cmd, &type, value, &size);
+		if (error != GC_ERR_SUCCESS)
+			g_clear_pointer (&value, g_free);
 	}
+
+	if (value == NULL)
+		arv_info_interface("_gentl_get_info_str: no info %d for '%s' (%s)", info_cmd,
+				   device != NULL ? device : "", arv_gentl_gc_error_to_string (error));
+
 	return value;
 }
 
@@ -175,14 +193,47 @@ static char *
 _gentl_get_id(GC_ERROR(*func)(void*, uint32_t, char*, size_t*), void *handle, uint32_t index)
 {
 	GC_ERROR error;
-	size_t size;
+	size_t size = 0;
 	char *value = NULL;
+
 	error = func(handle, index, NULL, &size);
-	if (error == GC_ERR_SUCCESS) {
-		value = g_malloc0(size);
-		func(handle, index, value, &size);
+	if (error == GC_ERR_SUCCESS && size > 0) {
+		value = g_malloc0(size + 1);
+		error = func(handle, index, value, &size);
+		if (error != GC_ERR_SUCCESS || value[0] == '\0')
+			g_clear_pointer (&value, g_free);
 	}
+
 	return value;
+}
+
+/* Missing or empty strings are replaced by a fallback. */
+
+static char *
+_take_string_or_fallback (char *value, const char *fallback)
+{
+	if (value != NULL && value[0] != '\0')
+		return value;
+
+	g_free (value);
+
+	return g_strdup (fallback);
+}
+
+/* Name of the producer file, without extension: used as transport layer vendor if the producer doesn't tell it */
+
+static char *
+_get_producer_name (ArvGenTLSystem *gentl_system)
+{
+	char *basename;
+	char *extension;
+
+	basename = g_path_get_basename (arv_gentl_system_get_filename (gentl_system));
+	extension = strrchr (basename, '.');
+	if (extension != NULL && extension != basename)
+		*extension = '\0';
+
+	return basename;
 }
 
 static uint32_t
@@ -210,7 +261,7 @@ static void
 _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 {
 	ArvGenTLInterfacePrivate *priv = arv_gentl_interface_get_instance_private(gentl_interface);
-	GList *gentl_systems = arv_gentl_get_systems();
+	GList *gentl_systems = arv_gentl_dup_systems();
 	GList *gentl_systems_iter;
 
 	g_hash_table_remove_all (priv->devices);
@@ -219,9 +270,24 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 	for ( gentl_systems_iter = gentl_systems; gentl_systems_iter; gentl_systems_iter = g_list_next(gentl_systems_iter) ) {
 		ArvGenTLSystem *gentl_system = gentl_systems_iter->data;
 		ArvGenTLModule * gentl = arv_gentl_system_get_gentl(gentl_system);
-		TL_HANDLE system_handle = arv_gentl_system_open_system_handle(gentl_system);
-		uint32_t num_interfaces = _gentl_refresh(gentl->TLUpdateInterfaceList,
-                                                         gentl->TLGetNumInterfaces, system_handle);
+		TL_HANDLE system_handle;
+		uint32_t num_interfaces;
+		char *tl_vendor, *tl_type;
+
+		/* No transport layer handle: the producer failed to open it, and is skipped */
+		system_handle = arv_gentl_system_open_system_handle(gentl_system);
+		if (system_handle == NULL)
+			continue;
+
+		num_interfaces = _gentl_refresh(gentl->TLUpdateInterfaceList, gentl->TLGetNumInterfaces, system_handle);
+
+		/* The transport layer vendor is part of the device id. The producer file name is used if the producer
+		 * doesn't tell its vendor, which keeps the ids of a device seen by several producers distinct. */
+		tl_vendor = _take_string_or_fallback (_gentl_get_tl_info_str(gentl, system_handle, TL_INFO_VENDOR), NULL);
+		if (tl_vendor == NULL)
+			tl_vendor = _get_producer_name (gentl_system);
+		tl_type = _take_string_or_fallback (_gentl_get_tl_info_str(gentl, system_handle, TL_INFO_TLTYPE),
+						    "Custom");
 
 		/* Iterate over all interfaces of a GenTL system */
 		for (uint32_t i=0; i<num_interfaces; i++) {
@@ -230,11 +296,16 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 			IF_HANDLE interface_handle;
 
 			interface_id = _gentl_get_id(gentl->TLGetInterfaceID, system_handle, i);
-			if (interface_id == NULL)
+			if (interface_id == NULL) {
+				arv_warning_interface ("[GenTLInterface::discovery] No id for interface %u of '%s'",
+						       i, arv_gentl_system_get_filename (gentl_system));
 				continue;
+			}
 
-			interface_type = _gentl_get_info_str(gentl->TLGetInterfaceInfo,
-                                                             system_handle, interface_id, INTERFACE_INFO_TLTYPE);
+			interface_type = _take_string_or_fallback
+				(_gentl_get_info_str(gentl->TLGetInterfaceInfo, system_handle, interface_id,
+						     INTERFACE_INFO_TLTYPE),
+				 tl_type);
 
 			interface_handle = arv_gentl_system_open_interface_handle(gentl_system, interface_id);
 			if (interface_handle == NULL) {
@@ -247,25 +318,40 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 
 			/* Iterate over all devices of a GenTL interface */
 			for (uint32_t j=0; j<num_devices; j++) {
-				char *tl_vendor, *device_id, *id, *model, *vendor, *serial_nbr;
+				char *device_id, *id, *model, *vendor, *serial_nbr;
 				ArvGenTLInterfaceDeviceInfos *device_infos;
 				ArvInterfaceDeviceIds *ids;
 
 				device_id = _gentl_get_id(gentl->IFGetDeviceID, interface_handle, j);
+				if (device_id == NULL) {
+					arv_warning_interface ("[GenTLInterface::discovery] No id for device %u of "
+							       "interface '%s'", j, interface_id);
+					continue;
+				}
 
-                                tl_vendor = _gentl_get_tl_info_str(gentl, system_handle, TL_INFO_VENDOR);
-
-				id = _gentl_get_info_str(gentl->IFGetDeviceInfo,
-                                                         interface_handle, device_id, DEVICE_INFO_ID);
-				model = _gentl_get_info_str(gentl->IFGetDeviceInfo,
-                                                            interface_handle, device_id, DEVICE_INFO_MODEL);
-				vendor = _gentl_get_info_str(gentl->IFGetDeviceInfo,
-                                                             interface_handle, device_id, DEVICE_INFO_VENDOR);
-				serial_nbr =  _gentl_get_info_str(gentl->IFGetDeviceInfo,
-                                                                  interface_handle, device_id, DEVICE_INFO_SERIAL_NUMBER);
+				/* The producer may not provide every string: the device id replaces a missing
+				 * DEVICE_INFO_ID, and a missing serial number in the Aravis device id, which then stays
+				 * unique. */
+				id = _take_string_or_fallback (_gentl_get_info_str(gentl->IFGetDeviceInfo,
+										  interface_handle, device_id,
+										  DEVICE_INFO_ID),
+							       device_id);
+				model = _take_string_or_fallback (_gentl_get_info_str(gentl->IFGetDeviceInfo,
+										     interface_handle, device_id,
+										     DEVICE_INFO_MODEL),
+								  "");
+				vendor = _take_string_or_fallback (_gentl_get_info_str(gentl->IFGetDeviceInfo,
+										      interface_handle, device_id,
+										      DEVICE_INFO_VENDOR),
+								   "");
+				serial_nbr = _take_string_or_fallback (_gentl_get_info_str(gentl->IFGetDeviceInfo,
+											  interface_handle, device_id,
+											  DEVICE_INFO_SERIAL_NUMBER),
+								       "");
 
 				device_infos =  arv_gentl_interface_device_infos_new(gentl_system, tl_vendor, interface_id, id,
-                                                                                    vendor, model, serial_nbr);
+                                                                                    vendor, model,
+										    serial_nbr[0] != '\0' ? serial_nbr : device_id);
                                 arv_info_interface ("[GentTLInterface::discovery] Device '%s' found",
                                                     device_infos->id);
 
@@ -308,7 +394,12 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 			g_clear_pointer(&interface_type, g_free);
 		}
 		arv_gentl_system_close_system_handle(gentl_system);
+
+		g_free (tl_vendor);
+		g_free (tl_type);
 	}
+
+	g_list_free_full (gentl_systems, g_object_unref);
 }
 
 static void
@@ -405,14 +496,11 @@ arv_gentl_interface_finalize (GObject *object)
 {
 	ArvGenTLInterface *gentl_interface = ARV_GENTL_INTERFACE (object);
 	ArvGenTLInterfacePrivate *priv = arv_gentl_interface_get_instance_private (gentl_interface);
-	GList *gentl_systems = arv_gentl_get_systems();
-	GList *gentl_systems_iter;
 
 	g_hash_table_unref (priv->devices);
 
-	for ( gentl_systems_iter = gentl_systems; gentl_systems_iter; gentl_systems_iter = g_list_next(gentl_systems_iter) ) {
-		g_object_unref(gentl_systems_iter->data);
-	}
+	/* Producers still used by a device stay loaded until the destruction of their last device */
+	arv_gentl_clear_systems ();
 
 	G_OBJECT_CLASS (arv_gentl_interface_parent_class)->finalize (object);
 }

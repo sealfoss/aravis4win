@@ -43,6 +43,7 @@ ARV_API void		arv_disable_interface		        (const char *interface_id);
 ARV_API void		arv_set_interface_flags                 (const char *interface_id, int flags);
 
 ARV_API void		arv_update_device_list		        (void);
+ARV_API guint64		arv_get_device_list_generation	        (void);
 ARV_API unsigned int	arv_get_n_devices		        (void);
 ARV_API const char *	arv_get_device_id		        (unsigned int index);
 ARV_API const char *	arv_get_device_physical_id	        (unsigned int index);
@@ -52,8 +53,11 @@ ARV_API const char *	arv_get_device_manufacturer_info        (unsigned int index
 ARV_API const char *	arv_get_device_model		        (unsigned int index);
 ARV_API const char *	arv_get_device_serial_nbr	        (unsigned int index);
 ARV_API const char *	arv_get_device_protocol		        (unsigned int index);
+ARV_API const char *	arv_get_device_interface_id	        (unsigned int index);
 
 ARV_API ArvDevice *	arv_open_device			        (const char *device_id, GError **error);
+ARV_API ArvDevice *	arv_open_device_on_interface	        (const char *interface_id, const char *device_id,
+								 GError **error);
 
 ARV_API void		arv_shutdown			        (void);
 

@@ -62,6 +62,12 @@ enum {
 typedef struct {
 	GAsyncQueue *input_queue;
 	GAsyncQueue *output_queue;
+        /* Queue lengths, each under the lock of its queue: g_async_queue_length () subtracts the threads waiting on a
+         * queue, so it reads -1 while the stream thread waits for an input buffer */
+        gint n_input_buffers;
+        gint n_output_buffers;
+        /* Atomic: popped from the input queue under its lock, pushed to the output queue under the other one, and
+         * from different threads (the USB transfer callbacks complete the async USB3Vision buffers) */
         gint n_buffer_filling;
 	GRecMutex mutex;
 	gboolean emit_signals;
@@ -103,7 +109,10 @@ arv_stream_push_buffer (ArvStream *stream, ArvBuffer *buffer)
 	g_return_if_fail (ARV_IS_STREAM (stream));
 	g_return_if_fail (ARV_IS_BUFFER (buffer));
 
-	g_async_queue_push (priv->input_queue, buffer);
+        g_async_queue_lock (priv->input_queue);
+	g_async_queue_push_unlocked (priv->input_queue, buffer);
+        priv->n_input_buffers++;
+        g_async_queue_unlock (priv->input_queue);
 }
 
 /**
@@ -125,10 +134,16 @@ ArvBuffer *
 arv_stream_pop_buffer (ArvStream *stream)
 {
 	ArvStreamPrivate *priv = arv_stream_get_instance_private (stream);
+        ArvBuffer *buffer;
 
 	g_return_val_if_fail (ARV_IS_STREAM (stream), NULL);
 
-	return g_async_queue_pop (priv->output_queue);
+        g_async_queue_lock (priv->output_queue);
+	buffer = g_async_queue_pop_unlocked (priv->output_queue);
+        priv->n_output_buffers--;
+        g_async_queue_unlock (priv->output_queue);
+
+        return buffer;
 }
 
 /**
@@ -150,10 +165,17 @@ ArvBuffer *
 arv_stream_try_pop_buffer (ArvStream *stream)
 {
 	ArvStreamPrivate *priv = arv_stream_get_instance_private (stream);
+        ArvBuffer *buffer;
 
 	g_return_val_if_fail (ARV_IS_STREAM (stream), NULL);
 
-	return g_async_queue_try_pop (priv->output_queue);
+        g_async_queue_lock (priv->output_queue);
+	buffer = g_async_queue_try_pop_unlocked (priv->output_queue);
+        if (buffer != NULL)
+                priv->n_output_buffers--;
+        g_async_queue_unlock (priv->output_queue);
+
+        return buffer;
 }
 
 /**
@@ -175,10 +197,17 @@ ArvBuffer *
 arv_stream_timeout_pop_buffer (ArvStream *stream, guint64 timeout)
 {
 	ArvStreamPrivate *priv = arv_stream_get_instance_private (stream);
+        ArvBuffer *buffer;
 
 	g_return_val_if_fail (ARV_IS_STREAM (stream), NULL);
 
-	return g_async_queue_timeout_pop (priv->output_queue, timeout);
+        g_async_queue_lock (priv->output_queue);
+	buffer = g_async_queue_timeout_pop_unlocked (priv->output_queue, timeout);
+        if (buffer != NULL)
+                priv->n_output_buffers--;
+        g_async_queue_unlock (priv->output_queue);
+
+        return buffer;
 }
 
 /**
@@ -200,8 +229,10 @@ arv_stream_pop_input_buffer (ArvStream *stream)
 
         g_async_queue_lock(priv->input_queue);
 	data = g_async_queue_try_pop_unlocked (priv->input_queue);
-        if (data != NULL)
-                priv->n_buffer_filling++;
+        if (data != NULL) {
+                priv->n_input_buffers--;
+                g_atomic_int_inc (&priv->n_buffer_filling);
+        }
         g_async_queue_unlock(priv->input_queue);
 
         return data;
@@ -217,8 +248,10 @@ arv_stream_timeout_pop_input_buffer (ArvStream *stream, guint64 timeout)
 
         g_async_queue_lock(priv->input_queue);
 	data = g_async_queue_timeout_pop_unlocked (priv->input_queue, timeout);
-        if (data != NULL)
-                priv->n_buffer_filling++;
+        if (data != NULL) {
+                priv->n_input_buffers--;
+                g_atomic_int_inc (&priv->n_buffer_filling);
+        }
         g_async_queue_unlock(priv->input_queue);
 
         return data;
@@ -234,7 +267,8 @@ arv_stream_push_output_buffer (ArvStream *stream, ArvBuffer *buffer)
 
         g_async_queue_lock (priv->output_queue);
 	g_async_queue_push_unlocked (priv->output_queue, buffer);
-        priv->n_buffer_filling--;
+        priv->n_output_buffers++;
+        g_atomic_int_add (&priv->n_buffer_filling, -1);
         g_async_queue_unlock(priv->output_queue);
 
 	g_rec_mutex_lock (&priv->mutex);
@@ -275,11 +309,11 @@ arv_stream_get_n_owned_buffers (ArvStream *stream, gint *n_input_buffers, gint *
         g_async_queue_lock (priv->input_queue);
         g_async_queue_lock (priv->output_queue);
 	if (n_input_buffers != NULL)
-		*n_input_buffers = g_async_queue_length_unlocked (priv->input_queue);
+		*n_input_buffers = priv->n_input_buffers;
 	if (n_output_buffers != NULL)
-		*n_output_buffers = g_async_queue_length_unlocked (priv->output_queue);
+		*n_output_buffers = priv->n_output_buffers;
         if (n_buffer_filling != NULL)
-                *n_buffer_filling = priv->n_buffer_filling;
+                *n_buffer_filling = g_atomic_int_get (&priv->n_buffer_filling);
         g_async_queue_unlock (priv->output_queue);
         g_async_queue_unlock (priv->input_queue);
 }
@@ -348,8 +382,9 @@ arv_stream_stop_acquisition (ArvStream *stream, GError **error)
 
 	success = stream_class->stop_acquisition (stream, error);
 
-        if (success && priv->n_buffer_filling != 0) {
-                g_critical ("Buffer filling count must be 0 after acquisition stop (was %d)", priv->n_buffer_filling);
+        if (success && g_atomic_int_get (&priv->n_buffer_filling) != 0) {
+                g_critical ("Buffer filling count must be 0 after acquisition stop (was %d)",
+                            g_atomic_int_get (&priv->n_buffer_filling));
         }
         if (!success)
                 arv_warning_stream ("Failed to stop stream acquisition ");
@@ -384,12 +419,14 @@ arv_stream_delete_buffers (ArvStream *stream)
 	g_async_queue_lock (priv->output_queue);
 
 	arv_info_stream ("[Stream::delete_buffers] Delete %d buffer[s] in input queue",
-                         g_async_queue_length_unlocked(priv->input_queue));
+                         priv->n_input_buffers);
 	arv_info_stream ("[Stream::delete_buffers] Delete %d buffer[s] in output queue",
-                         g_async_queue_length_unlocked(priv->output_queue));
+                         priv->n_output_buffers);
 
 	do {
 		buffer = g_async_queue_try_pop_unlocked (priv->input_queue);
+                if (buffer != NULL)
+                        priv->n_input_buffers--;
 		if (ARV_IS_BUFFER(buffer)) {
 			g_object_unref (buffer);
 			n_deleted++;
@@ -398,6 +435,8 @@ arv_stream_delete_buffers (ArvStream *stream)
 
 	do {
 		buffer = g_async_queue_try_pop_unlocked (priv->output_queue);
+                if (buffer != NULL)
+                        priv->n_output_buffers--;
 		if (ARV_IS_BUFFER(buffer)) {
 			g_object_unref (buffer);
 			n_deleted++;

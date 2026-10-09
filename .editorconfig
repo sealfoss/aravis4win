@@ -10,3 +10,7 @@ indent_style = space
 max_line_length = 120
 tab_width = 8
 trim_trailing_whitespace = true
+
+# Windows reads INF files and MakeCat definitions with CRLF line endings
+[*.{inf,cdf}]
+end_of_line = crlf

@@ -3623,7 +3623,9 @@ arv_camera_gv_get_packet_size (ArvCamera *camera, GError **error)
  * Automatically determine the biggest packet size that can be used data
  * streaming, and set GevSCPSPacketSize value accordingly. This function relies
  * on the GevSCPSFireTestPacket feature. If this feature is not available, the
- * packet size will be set to a default value (1500 bytes).
+ * current packet size is kept. In both cases, the packet size never exceeds the
+ * MTU of the host network interface the device is reached through, when the
+ * operating system reports it.
  *
  * Returns: The packet size, in bytes.
  *
@@ -3948,10 +3950,16 @@ arv_camera_uv_set_usb_mode (ArvCamera *camera, ArvUvUsbMode usb_mode)
 /**
  * arv_camera_uv_set_maximum_transfer_size:
  * @camera: a #ArvCamera
- * @size: maximum bulk transfer size, in bytes
+ * @size: maximum bulk transfer size, in bytes, from 1 KiB (1024) to 64 MiB (67108864), or 0 for the default (1 MiB)
  *
  * Set the maximum size when asking for a USB bulk transfer. The default value should work most of the time, but you may
  * have to tweak this setting in order to get reliable transfers.
+ *
+ * The size applies to the streams created afterwards. A size out of range is refused with a warning, and the previous
+ * size is kept. At each acquisition start, the stream uses the largest size not above this one that is a multiple of
+ * the payload alignment the camera requires and of the USB packet size, capped at the largest read WinUSB's RAW_IO
+ * policy accepts when it is on; see [method@Aravis.UvDevice.set_maximum_transfer_size] and the USB section of the
+ * documentation.
  *
  * ::: note "Help needed"
  *     It would be nice to be able to compute a working value for any OS/driver combination aravis is

@@ -34,6 +34,10 @@
 G_BEGIN_DECLS
 
 #define ARV_UV_STREAM_MAXIMUM_TRANSFER_SIZE_DEFAULT	(1*1024*1024)
+/* Range accepted by arv_uv_device_set_maximum_transfer_size (): one SuperSpeed packet, and a size whose
+ * ARV_UV_STREAM_N_MAXIMUM_SUBMITS transfers in flight stay well within the int byte counts of the stream and libusb */
+#define ARV_UV_STREAM_MAXIMUM_TRANSFER_SIZE_MIN		1024
+#define ARV_UV_STREAM_MAXIMUM_TRANSFER_SIZE_MAX		(64*1024*1024)
 #define ARV_UV_STREAM_N_MAXIMUM_SUBMITS                 8
 
 ArvStream * 	arv_uv_stream_new	(ArvUvDevice *uv_device,

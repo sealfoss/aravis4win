@@ -44,6 +44,7 @@
 
 typedef struct {
 	GSocketAddress *interface_address;
+	GInetAddress *interface_netmask;	/* NULL if unknown */
 	GSocketAddress *broadcast_address;
 	GSocket *socket;
 } ArvGvDiscoverSocket;
@@ -71,6 +72,7 @@ static void
 arv_gv_discover_socket_free (ArvGvDiscoverSocket *discover_socket)
 {
         g_clear_object (&discover_socket->interface_address);
+        g_clear_object (&discover_socket->interface_netmask);
         g_clear_object (&discover_socket->broadcast_address);
         g_clear_object (&discover_socket->socket);
         g_free (discover_socket);
@@ -97,6 +99,7 @@ arv_gv_discover_socket_list_new (const char *discovery_interface)
 		GSocketAddress *socket_broadcast;
 		GInetAddress *inet_address;
 		GInetAddress *inet_broadcast;
+		struct sockaddr *netmask;
 		char *inet_address_string;
 		char *inet_broadcast_string;
 		GError *error = NULL;
@@ -107,6 +110,14 @@ arv_gv_discover_socket_list_new (const char *discovery_interface)
 				continue;
 
 		discover_socket = g_new0 (ArvGvDiscoverSocket, 1);
+
+		/* The netmask family is not set on every platform: read it as an IPv4 netmask, like the interface
+		 * address */
+		netmask = arv_network_interface_get_netmask (iface_iter->data);
+		if (netmask != NULL)
+			discover_socket->interface_netmask = g_inet_address_new_from_bytes
+				((const guint8 *) &((struct sockaddr_in *) netmask)->sin_addr, G_SOCKET_FAMILY_IPV4);
+
 		socket_address = g_socket_address_new_from_native (arv_network_interface_get_addr(iface_iter->data),
 									sizeof (struct sockaddr));
 		socket_broadcast = g_socket_address_new_from_native (arv_network_interface_get_broadaddr(iface_iter->data),
@@ -226,6 +237,43 @@ arv_gv_discover_socket_list_send_discover_packet (ArvGvDiscoverSocketList *socke
         g_object_unref (broadcast_socket_address);
 
 	arv_gvcp_packet_free (packet);
+}
+
+static GInetAddress *
+arv_gv_discover_socket_get_interface_address (ArvGvDiscoverSocket *discover_socket)
+{
+	return g_inet_socket_address_get_address (G_INET_SOCKET_ADDRESS (discover_socket->interface_address));
+}
+
+static gboolean
+arv_gv_discover_socket_is_on_subnet (ArvGvDiscoverSocket *discover_socket, GInetAddress *address)
+{
+	return arv_network_address_is_on_subnet (address,
+						 arv_gv_discover_socket_get_interface_address (discover_socket),
+						 discover_socket->interface_netmask);
+}
+
+/* The host sends the packets for a device through the interface whose subnet contains the device address, whichever
+ * interface the discovery answer of the device came through. A device on the host itself, like a fake camera on
+ * 127.0.0.1, receives the discovery broadcast sent through every interface, and answers all of them, in any order.
+ * Reach a device through the interface of its answer if the device is on its subnet, otherwise through the first
+ * discovery interface whose subnet contains the device address, if any. */
+
+static GInetAddress *
+arv_gv_discover_socket_list_get_device_interface_address (ArvGvDiscoverSocketList *socket_list,
+							  ArvGvDiscoverSocket *answer_socket,
+							  GInetAddress *device_address)
+{
+	GSList *iter;
+
+	if (!arv_gv_discover_socket_is_on_subnet (answer_socket, device_address)) {
+		for (iter = socket_list->sockets; iter != NULL; iter = iter->next) {
+			if (arv_gv_discover_socket_is_on_subnet (iter->data, device_address))
+				return arv_gv_discover_socket_get_interface_address (iter->data);
+		}
+	}
+
+	return arv_gv_discover_socket_get_interface_address (answer_socket);
 }
 
 /* ArvGvInterfaceDeviceInfos implementation */
@@ -362,6 +410,8 @@ struct _ArvGvInterfaceClass {
 
 G_DEFINE_TYPE_WITH_CODE (ArvGvInterface, arv_gv_interface, ARV_TYPE_INTERFACE, G_ADD_PRIVATE (ArvGvInterface))
 
+static GInetAddress *_device_infos_to_ginetaddress (ArvGvInterfaceDeviceInfos *device_infos);
+
 static ArvGvInterfaceDeviceInfos *
 _discover (GHashTable *devices, const char *device_id, gboolean allow_broadcast_discovery_ack, const char *discovery_interface)
 {
@@ -431,6 +481,9 @@ _discover (GHashTable *devices, const char *device_id, gboolean allow_broadcast_
 												  packet, count);
 
                                                 if (device_infos != NULL) {
+                                                        GInetAddress *device_address;
+                                                        GInetAddress *device_interface_address;
+
                                                         address_string = g_inet_address_to_string (interface_address);
                                                         arv_info_interface ("[GvInterface::discovery] Device '%s' found "
                                                                             "(interface %s) user_id '%s' - MAC '%s'",
@@ -440,6 +493,25 @@ _discover (GHashTable *devices, const char *device_id, gboolean allow_broadcast_
                                                                             device_infos->mac);
 
                                                         g_free (address_string);
+
+                                                        device_address = _device_infos_to_ginetaddress (device_infos);
+                                                        device_interface_address =
+                                                                arv_gv_discover_socket_list_get_device_interface_address
+                                                                (socket_list, discover_socket, device_address);
+                                                        if (device_interface_address != interface_address) {
+                                                                g_object_unref (device_infos->interface_address);
+                                                                device_infos->interface_address =
+                                                                        g_object_ref (device_interface_address);
+
+                                                                address_string = g_inet_address_to_string
+                                                                        (device_interface_address);
+                                                                arv_info_interface
+                                                                        ("[GvInterface::discovery] Device '%s'"
+                                                                         " reached through interface %s, on its"
+                                                                         " subnet", device_infos->id, address_string);
+                                                                g_free (address_string);
+                                                        }
+                                                        g_object_unref (device_address);
 
                                                         if (devices != NULL) {
                                                                 if (device_infos->id != NULL &&

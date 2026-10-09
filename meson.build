@@ -47,7 +47,9 @@ elif cc.get_id()=='msvc'
   add_project_arguments(cc.get_supported_arguments(warning_c_args), language: 'c')
 endif
 
-build_shared = get_option('default_library') == 'shared'
+# 'shared' and 'both' build a shared library, which must export the API. With 'both', the static library is made of
+# the same objects, whose exports are harmless in a static link.
+build_shared = get_option('default_library') != 'static'
 
 if cc.get_id() == 'msvc'
   if build_shared
@@ -71,7 +73,31 @@ gobject_dep = dependency ('gobject-2.0', required: true)
 gio_dep = dependency ('gio-2.0', required: true)
 xml2_dep = dependency ('libxml-2.0', required: true)
 libz_dep = dependency ('zlib', required: true)
-usb_dep = dependency ('libusb-1.0', required: get_option ('usb'))
+usb_option = get_option ('usb')
+if host_machine.system () == 'windows'
+  # Before libusb 1.0.27, the WinUSB backend can only claim the first interface
+  # of a function, so the data interface of a USB3 Vision camera bound to WinUSB
+  # cannot be claimed (issue #431). libusb 1.0.30 adds the RAW_IO functions and
+  # an optional hotplug backend. When no suitable libusb is installed, meson
+  # builds libusb 1.0.30 from subprojects/libusb.wrap; add
+  # -Dlibusb:windows-hotplug=true for its hotplug flavour.
+  usb_dep = dependency ('libusb-1.0', version: '>=1.0.27', required: usb_option,
+                        fallback: ['libusb', 'libusb_dep'],
+                        default_options: ['examples=false', 'tests=false'],
+                        not_found_message: 'USB support on Windows needs libusb-1.0 >= 1.0.27: older versions cannot ' +
+                        'claim the data interface of a USB3 Vision camera bound to WinUSB. Neither an installed ' +
+                        'libusb-1.0 >= 1.0.27 nor subprojects/libusb.wrap could be used. --wrap-mode=nofallback ' +
+                        'keeps meson from building the wrap, as does --wrap-mode=nodownload unless the libusb ' +
+                        'tarball is in subprojects/packagecache; otherwise, the error of the libusb subproject ' +
+                        'above says why it failed. Install libusb >= 1.0.30, or let meson build the wrap.')
+  if usb_dep.found () and usb_dep.version ().version_compare ('<1.0.30')
+    warning ('libusb-1.0 @0@ lacks the WinUSB RAW_IO functions and the hotplug backend of libusb 1.0.30. '.format (usb_dep.version ()) +
+             'USB3 Vision cameras work, without these features. Use libusb >= 1.0.30, for example with ' +
+             '--force-fallback-for=libusb-1.0, which builds subprojects/libusb.wrap.')
+  endif
+else
+  usb_dep = dependency ('libusb-1.0', required: usb_option)
+endif
 gmodule_dep = dependency ('gmodule-2.0', required: true)
 gudev_dep = dependency ('gudev-1.0', required: get_option('v4l2'))
 
@@ -80,10 +106,6 @@ aravis_dependencies = [aravis_public_dependencies, xml2_dep, libz_dep, gmodule_d
 if cc.get_id()!='msvc'
 	libm = cc.find_library ('m', required: true)
 	aravis_dependencies += libm
-endif
-
-if usb_dep.found()
-  aravis_dependencies += usb_dep
 endif
 
 if gudev_dep.found()
@@ -98,6 +120,13 @@ if host_machine.system()=='windows'
 		cc.find_library('ws2_32', required: true),  # socket functions
 		cc.find_library('iphlpapi', required: true) # GetAdaptersAddresses
 	]
+endif
+
+# Used by the fake libusb based tests, which link their own libusb (tests/fakeusb)
+aravis_dependencies_without_usb = aravis_dependencies
+
+if usb_dep.found()
+  aravis_dependencies += usb_dep
 endif
 
 packet_socket_option = get_option('packet-socket')
@@ -119,7 +148,7 @@ else # not Linux
 endif
 
 subdir ('src')
-subdir ('tests')
+subdir ('data' / 'windows')
 
 viewer_enabled = false
 viewer_option = get_option ('viewer')
@@ -135,6 +164,9 @@ gst_option = get_option ('gst-plugin')
 gst_deps = aravis_dependencies + [dependency ('gstreamer-base-1.0', required: gst_option),
                                   dependency ('gstreamer-app-1.0', required: gst_option)]
 subdir('gst', if_found: gst_deps)
+
+# After gst/: the GStreamer plugin tests depend on the plugin
+subdir ('tests')
 
 doc_deps = dependency ('gi-docgen', version:'>= 2021.1', fallback: ['gi-docgen', 'dummy_dep'], required:get_option('documentation'))
 subdir('docs', if_found: doc_deps)

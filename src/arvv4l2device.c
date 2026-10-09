@@ -31,6 +31,7 @@
 #include <arvv4l2miscprivate.h>
 #include <arvdebugprivate.h>
 #include <arvmisc.h>
+#include <arvresources.h>
 #include <linux/videodev2.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -760,7 +761,8 @@ arv_v4l2_device_constructed (GObject *self)
 						(cap.version >>  8) & 0xff,
 						(cap.version >>  0) & 0xff);
 
-	bytes = g_resources_lookup_data("/org/aravis/arv-v4l2.xml",
+	/* From the resource bundle of the library itself, which the reference keeps in a static link */
+	bytes = g_resource_lookup_data (arvresources_get_resource (), "/org/aravis/arv-v4l2.xml",
 					G_RESOURCE_LOOKUP_FLAGS_NONE, &error);
 	if (error != NULL) {
 		arv_device_take_init_error (ARV_DEVICE (self),

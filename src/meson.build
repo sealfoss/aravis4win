@@ -198,6 +198,7 @@ library_private_headers = [
 	'arvnetworkprivate.h',
 	'arvrealtimeprivate.h',
 	'arvstreamprivate.h',
+	'arvsystemprivate.h',
 	'arvwakeupprivate.h'
 ]
 
@@ -296,6 +297,28 @@ library_c_args = [
 	'-DARAVIS_COMPILATION'
 	]
 
+# On Windows, arvuvdevice.c looks the functions of libusb 1.0.30 up at run time,
+# in the libusb DLL, so that Aravis still loads with an older libusb-1.0.dll. A
+# libusb linked statically is not a DLL and exports nothing: ARV_UV_LIBUSB_STATIC
+# has them called directly. That is the libusb of subprojects/libusb.wrap built
+# as a static library, or an installed libusb whose internal usbi_backend links,
+# which an import library, exporting the API only, does not provide.
+if usb_dep.found() and host_machine.system() == 'windows'
+	libusb_static = false
+	if usb_dep.type_name() == 'internal'
+		libusb_subproject = subproject('libusb', required: false)
+		if libusb_subproject.found()
+			libusb_static = not libusb_subproject.get_variable('libusb').full_path().endswith('.dll')
+		endif
+	else
+		libusb_static = cc.links('extern const char usbi_backend; int main (void) { return usbi_backend; }',
+					 dependencies: usb_dep, name: 'libusb linked statically')
+	endif
+	if libusb_static
+		library_c_args += '-DARV_UV_LIBUSB_STATIC'
+	endif
+endif
+
 aravis_library = library ('aravis-@0@'.format (aravis_api_version),
 	library_sources, library_headers,
 	library_no_introspection_sources, library_no_introspection_headers, library_private_headers,
@@ -327,13 +350,16 @@ progs = [
   [ 'arv-fake-gv-camera', 	'arvfakegvcamera.c'],
 ]
 
+# Executables by name, for the tests running the utilities
+aravis_programs = {}
+
 foreach p: progs
-	executable ((p[0] + '-@0@').format (aravis_api_version),
+	aravis_programs += {p[0]: executable ((p[0] + '-@0@').format (aravis_api_version),
 		p[1],
 		link_with: aravis_library,
 		c_args: library_c_args,
 		dependencies: aravis_dependencies,
-		install: true)
+		install: true)}
 endforeach
 
 introspection_option = get_option('introspection')

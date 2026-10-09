@@ -1,0 +1,74 @@
+; aravis-u3v.inf: WinUSB as the driver of USB3 Vision cameras, for Aravis
+;
+; Aravis opens USB3 Vision cameras through libusb, which on Windows can only open
+; a device whose driver is WinUSB (winusb.sys, part of Windows), the recommended
+; one, or libusbK or libusb0, which libusb drives through libusbK.dll. This INF
+; installs WinUSB on the USB3 Vision function of a camera, the device node with
+; the compatible ID USB\Class_EF&SubClass_05&Prot_00, so it covers the cameras of
+; every vendor. It needs libusb 1.0.27 or later.
+;
+; Windows ranks a compatible-ID match below the hardware-ID match of a camera
+; vendor's driver, and pnputil does not force a lower-ranked driver onto a device,
+; so this INF never replaces the driver that a vendor's software installed.
+;
+; Windows installs only signed driver packages, and this one ships without its
+; catalog, aravis-u3v.cat: create the catalog with MakeCat from aravis-u3v.cdf,
+; sign it with your own certificate, and add that certificate to the Trusted Root
+; Certification Authorities and Trusted Publishers stores of the local machine.
+; Then install the package with "pnputil /add-driver aravis-u3v.inf /install", or
+; with arv-winusb-setup.ps1. Both files are installed next to this one.
+;
+; x64 only: Windows in S mode installs only driver packages signed by Microsoft,
+; Windows on ARM64 is reported to do the same (unverified), and Windows 11 has no
+; 32-bit x86 edition.
+;
+; Documentation: https://aravisproject.github.io/aravis/aravis-main/usb.html
+;
+; Keep this file ASCII with CRLF line endings (see .gitattributes), and update
+; DriverVer whenever it changes.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider    = %ManufacturerName%
+CatalogFile = aravis-u3v.cat
+DriverVer   = 10/08/2026,1.0.0.1
+PnpLockdown = 1
+
+; ========== Manufacturer and Models sections ==========
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = USB_Install, USB\Class_EF&SubClass_05&Prot_00
+
+; ========== Installation ==========
+
+; As the inbox winusb.inf asks of an INF that includes it, each install section
+; includes the corresponding WinUSB section, even WINUSB.NT.HW, which is empty.
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[USB_Install.HW]
+Include = winusb.inf
+Needs   = WINUSB.NT.HW
+AddReg  = Dev_AddReg
+
+; The device interface class that WinUSB registers for the camera, and through
+; which libusb finds it. Generated for Aravis, shared by all its cameras.
+[Dev_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{CF9A8954-37DB-49E9-8C34-346799A3FB0C}"
+
+; ========== Strings ==========
+
+[Strings]
+ManufacturerName = "Aravis Project"
+DeviceName       = "USB3 Vision camera (WinUSB for Aravis)"

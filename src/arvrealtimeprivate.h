@@ -37,5 +37,25 @@ ARV_API gint64		arv_rtkit_get_rttime_usec_max 		(GDBusConnection *connection, GE
 ARV_API void		arv_rtkit_make_realtime 		(GDBusConnection *connection, pid_t thread, int priority, GError **error);
 ARV_API void		arv_rtkit_make_high_priority 		(GDBusConnection *connection, pid_t thread, int nice_level, GError **error);
 
+#else
+
+#include <windows.h>
+
+/* A priority request of arv_make_thread_realtime () or arv_make_thread_high_priority (), and what Windows answered */
+
+typedef struct {
+	DWORD requested_class;		/* SetPriorityClass () argument, 0 to keep the process priority class */
+	gboolean class_set;		/* SetPriorityClass () result */
+	DWORD class_error;		/* GetLastError () after a SetPriorityClass () failure */
+	DWORD granted_class;		/* GetPriorityClass () after the request, 0 if it failed */
+	int requested_priority;		/* SetThreadPriority () argument */
+	gboolean priority_set;		/* SetThreadPriority () result */
+	DWORD priority_error;		/* GetLastError () after a SetThreadPriority () failure */
+	int granted_priority;		/* GetThreadPriority () after the request */
+} ArvWin32PriorityRequest;
+
+/* private, but used by tests */
+gboolean		arv_win32_check_priority_request	(const ArvWin32PriorityRequest *request);
+
 #endif
 #endif

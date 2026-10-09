@@ -52,6 +52,27 @@ G_BEGIN_DECLS
 GRegex * 		arv_gv_device_get_url_regex 			(void);
 void                    arv_gc_set_default_gv_features                  (ArvGc *genicam);
 
+/* The stream which configured a stream channel last owns it, and disables it when destroyed. A stream configures the
+ * channel and takes it, or releases it and disables it, with the stream channel lock held. */
+void			arv_gv_device_lock_stream_channels		(ArvGvDevice *gv_device);
+void			arv_gv_device_unlock_stream_channels		(ArvGvDevice *gv_device);
+void			arv_gv_device_take_stream_channel		(ArvGvDevice *gv_device, guint channel,
+									 gconstpointer stream);
+gboolean		arv_gv_device_release_stream_channel		(ArvGvDevice *gv_device, guint channel,
+									 gconstpointer stream);
+
+/* Packet size negotiation logic of arv_gv_device_auto_packet_size(). The test function sets the packet size, updates
+ * it with the value the device actually uses, and returns whether a test packet of that size reached the host. */
+
+typedef gboolean	(*ArvGvDevicePacketSizeTest)			(guint *packet_size, void *user_data, GError **error);
+
+/* private, but used by tests */
+ARV_API guint		arv_gv_device_search_packet_size		(guint packet_size,
+									 guint min_size, guint max_size, guint inc,
+									 guint mtu, gboolean exit_early,
+									 ArvGvDevicePacketSizeTest test_func, void *test_data,
+									 GError **error);
+
 G_END_DECLS
 
 #endif

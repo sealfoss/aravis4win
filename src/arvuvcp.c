@@ -90,7 +90,7 @@ arv_uvcp_packet_new_write_memory_cmd (guint64 address, guint32 size, guint16 pac
 
 	g_return_val_if_fail (packet_size != NULL, NULL);
 
-	*packet_size = sizeof (ArvUvcpWriteMemoryCmd) + size;
+	*packet_size = arv_uvcp_packet_get_write_memory_cmd_size (size);
 
 	packet = g_malloc (*packet_size);
 

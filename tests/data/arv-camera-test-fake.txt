@@ -1,0 +1,19 @@
+Looking for camera 'Fake_1'
+vendor name            = Aravis
+model name             = Fake
+device serial number   = 1
+image width            = 512
+image height           = 512
+horizontal binning     = 1
+vertical binning       = 1
+exposure               = 10000 µs
+gain                   = 0 dB
+payload                = 262144 bytes
+ 25 frames/s -    6.55 MiB/s
+ 25 frames/s -    6.55 MiB/s
+ 25 frames/s -    6.55 MiB/s
+n_completed_buffers    = 75
+n_failures             = 0
+n_underruns            = 0
+n_transferred_bytes    = 19660800
+n_ignored_bytes        = 0

@@ -222,13 +222,30 @@ typedef enum {
 	ARV_DOM_DOCUMENT_ERROR_INVALID_XML
 } ArvDomDocumentError;
 
+/* Several threads may parse documents at the same time, for example when they open cameras: the parser state belongs
+ * to each parse, and libxml2 is initialized once, before its first use, as its older versions require from
+ * multithreaded programs. */
+
+static void
+_init_xml_parser (void)
+{
+	static gsize is_initialized = 0;
+
+	if (g_once_init_enter (&is_initialized)) {
+		xmlInitParser ();
+		g_once_init_leave (&is_initialized, 1);
+	}
+}
+
 #if LIBXML_VERSION >= 21100
 static ArvDomDocument *
 _parse_memory (ArvDomDocument *document, ArvDomNode *node,
 	       const void *buffer, int size, GError **error)
 {
-	static ArvDomSaxParserState state;
+	ArvDomSaxParserState state = {0};
         xmlParserCtxt *xml_parser_ctxt;
+
+	_init_xml_parser ();
 
 	state.document = document;
 	if (node != NULL)
@@ -272,7 +289,9 @@ static ArvDomDocument *
 _parse_memory (ArvDomDocument *document, ArvDomNode *node,
 	       const void *buffer, int size, GError **error)
 {
-	static ArvDomSaxParserState state;
+	ArvDomSaxParserState state = {0};
+
+	_init_xml_parser ();
 
 	state.document = document;
 	if (node != NULL)

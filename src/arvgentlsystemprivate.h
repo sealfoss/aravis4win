@@ -32,6 +32,9 @@
 
 G_BEGIN_DECLS
 
+/* Function table of a GenTL producer. The members marked optional may be NULL: see arv_gentl_symbols in
+ * arvgentlsystem.c, which defines which symbols a producer must export. */
+
 typedef struct {
     /* Global functions */
     PGCInitLib                 GCInitLib;
@@ -103,9 +106,11 @@ typedef struct {
     PEventKill                 EventKill;
 } ArvGenTLModule;
 
-GList *			arv_gentl_get_systems                   (void);
+GList *			arv_gentl_dup_systems                   (void);
+void			arv_gentl_clear_systems                 (void);
 
 ArvGenTLModule *	arv_gentl_system_get_gentl              (ArvGenTLSystem *system);
+const char *		arv_gentl_system_get_filename           (ArvGenTLSystem *system);
 
 TL_HANDLE 		arv_gentl_system_open_system_handle     (ArvGenTLSystem *system);
 void 			arv_gentl_system_close_system_handle    (ArvGenTLSystem *system);
@@ -120,7 +125,7 @@ DEV_HANDLE 		arv_gentl_system_open_device_handle     (ArvGenTLSystem *system,
                                                                  const char *device_id);
 void 			arv_gentl_system_close_device_handle    (ArvGenTLSystem *system,
                                                                  const char *interface_id,
-                                                                 DEV_HANDLE *device_handle);
+                                                                 DEV_HANDLE device_handle);
 
 G_END_DECLS
 

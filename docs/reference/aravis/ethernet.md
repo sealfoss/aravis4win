@@ -13,6 +13,12 @@ traffic may lead to packet lost. If your machine ethernet port has a lower
 bandwidth than the camera, make sure the stream you are requesting will not
 exceed its bandwidth.
 
+A device may answer the discovery through several network interfaces of the
+host, for example when they share the same network, or when the device runs on
+the host itself, like the fake camera. Aravis then reaches it through the
+interface whose subnet contains the device address, if there is one, as the
+host normally sends the device packets through it.
+
 ## Socket Buffer Size
 
 Under heavy CPU load, the input socket buffer size may be increased in order to avoid
@@ -91,6 +97,25 @@ iface ethusb0 inet static
 Please note if your device is not connected directly to the machine, you may
 also have to tweak the active devices on your network.
 
+The packet size counts the whole IP datagram, so a packet larger than the MTU of
+the interface the device is reached through can't be received without
+fragmentation. When the operating system reports this MTU, the automatic packet
+size adjustment (done at stream creation, see
+[method@Aravis.Camera.gv_set_packet_size_adjustment], or by
+[method@Aravis.Camera.gv_auto_packet_size]) never selects a larger packet size,
+and lowers a larger current packet size to the MTU, even for devices that can't
+send test packets. The `never` adjustment mode
+(`--packet-size-adjustment=never` for `arv-camera-test`) keeps the packet size
+unchanged.
+
+When frames fail with only their leader and trailer packets received, which is
+the usual symptom of data packets larger than the MTU of the host interface or
+of the network, the stream counts them in its `n_leader_trailer_only_failures`
+statistic and logs a warning naming the packet size and the interface MTU. The
+last data packet of a frame may be smaller than the others, and get through:
+frames with none of their full size data packets received are counted too. Use
+`--debug=stream:1`, or `ARV_DEBUG=stream:1`, to see the warning.
+
 ## Packet Socket Support
 
 Aravis can use packet sockets for the video receiving thread. But this mode
@@ -101,6 +126,18 @@ example, the following command gives this capability to the Aravis viewer:
 ```
 sudo setcap cap_net_raw+ep arv-viewer
 ```
+
+A packet socket sees the IP packets before their reassembly. A GVSP packet
+larger than the MTU of the network path arrives in several IP fragments, which
+the packet socket can't put back together: such a packet is ignored, and counts
+as missing in its frame. A warning of the same `stream` debug category then
+suggests to lower the packet size, or to disable the packet socket, with
+[method@Aravis.Camera.gv_set_stream_options] (`--no-packet-socket` for
+`arv-camera-test`).
+
+The traffic of a device running on the host itself, like the fake camera, goes
+through the loopback interface. The packet socket is not used for such a device
+when it is reached through the address of another interface.
 
 # Legacy endianess mechanism
 

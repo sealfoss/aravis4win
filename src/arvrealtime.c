@@ -240,6 +240,10 @@ static pid_t _gettid(void) {
  * Try to make current thread realtime. It first try to use sched_setscheduler,
  * and if it fails, use rtkit.
  *
+ * On Windows, the process gets REALTIME_PRIORITY_CLASS and the thread THREAD_PRIORITY_TIME_CRITICAL; @priority is
+ * not used. Without the privilege to increase the scheduling priority, Windows grants HIGH_PRIORITY_CLASS instead: the
+ * thread is not realtime, and this function returns %FALSE.
+ *
  * Since: 0.4.0
  */
 
@@ -295,6 +299,8 @@ arv_make_thread_realtime (int priority)
  *
  * Try to set current thread nice level to high priority, using rtkit.
  *
+ * On Windows, the thread gets THREAD_PRIORITY_HIGHEST; @nice_level is not used.
+ *
  * Since: 0.4.0
  */
 
@@ -327,31 +333,147 @@ arv_make_thread_high_priority (int nice_level)
 
 #elif defined(G_OS_WIN32)
 
+static const char *
+_priority_class_name (DWORD priority_class)
+{
+	switch (priority_class) {
+		case IDLE_PRIORITY_CLASS:
+			return "IDLE_PRIORITY_CLASS";
+		case BELOW_NORMAL_PRIORITY_CLASS:
+			return "BELOW_NORMAL_PRIORITY_CLASS";
+		case NORMAL_PRIORITY_CLASS:
+			return "NORMAL_PRIORITY_CLASS";
+		case ABOVE_NORMAL_PRIORITY_CLASS:
+			return "ABOVE_NORMAL_PRIORITY_CLASS";
+		case HIGH_PRIORITY_CLASS:
+			return "HIGH_PRIORITY_CLASS";
+		case REALTIME_PRIORITY_CLASS:
+			return "REALTIME_PRIORITY_CLASS";
+		default:
+			return "unknown";
+	}
+}
+
+static const char *
+_thread_priority_name (int priority)
+{
+	switch (priority) {
+		case THREAD_PRIORITY_IDLE:
+			return "THREAD_PRIORITY_IDLE";
+		case THREAD_PRIORITY_LOWEST:
+			return "THREAD_PRIORITY_LOWEST";
+		case THREAD_PRIORITY_BELOW_NORMAL:
+			return "THREAD_PRIORITY_BELOW_NORMAL";
+		case THREAD_PRIORITY_NORMAL:
+			return "THREAD_PRIORITY_NORMAL";
+		case THREAD_PRIORITY_ABOVE_NORMAL:
+			return "THREAD_PRIORITY_ABOVE_NORMAL";
+		case THREAD_PRIORITY_HIGHEST:
+			return "THREAD_PRIORITY_HIGHEST";
+		case THREAD_PRIORITY_TIME_CRITICAL:
+			return "THREAD_PRIORITY_TIME_CRITICAL";
+		case THREAD_PRIORITY_ERROR_RETURN:
+			return "unknown";
+		default:
+			return "unnamed";
+	}
+}
+
+/*
+ * arv_win32_check_priority_request:
+ * @request: a priority request, and what Windows answered
+ *
+ * Tells whether Windows granted @request, from the values read back after it, as SetPriorityClass () may succeed
+ * without granting the requested class. Without the privilege to increase the scheduling priority
+ * (SeIncreaseBasePriorityPrivilege, which administrators have), a process that asks for REALTIME_PRIORITY_CLASS gets
+ * HIGH_PRIORITY_CLASS. Logs what the thread got, with a warning for each part of the request that was not granted.
+ *
+ * Returns: %TRUE if the process has the requested priority class, if any, and the thread the requested priority.
+ */
+
+gboolean
+arv_win32_check_priority_request (const ArvWin32PriorityRequest *request)
+{
+	gboolean success = TRUE;
+
+	g_return_val_if_fail (request != NULL, FALSE);
+
+	if (request->requested_class != 0) {
+		if (!request->class_set) {
+			arv_warning_misc ("SetPriorityClass (%s) failed (error %lu)",
+					  _priority_class_name (request->requested_class), request->class_error);
+			success = FALSE;
+		} else if (request->granted_class != request->requested_class) {
+			arv_warning_misc ("SetPriorityClass (%s) succeeded, but the process has class %s%s",
+					  _priority_class_name (request->requested_class),
+					  _priority_class_name (request->granted_class),
+					  request->requested_class == REALTIME_PRIORITY_CLASS ?
+					  ": the realtime class needs the privilege to increase the scheduling priority "
+					  "(SeIncreaseBasePriorityPrivilege)" : "");
+			success = FALSE;
+		}
+	}
+
+	if (!request->priority_set) {
+		arv_warning_misc ("SetThreadPriority (%s) failed (error %lu)",
+				  _thread_priority_name (request->requested_priority), request->priority_error);
+		success = FALSE;
+	} else if (request->granted_priority != request->requested_priority) {
+		arv_warning_misc ("SetThreadPriority (%s) succeeded, but the thread has priority %d",
+				  _thread_priority_name (request->requested_priority), request->granted_priority);
+		success = FALSE;
+	}
+
+	arv_info_misc ("Thread priority %d (%s), process priority class %s",
+		       request->granted_priority, _thread_priority_name (request->granted_priority),
+		       _priority_class_name (request->granted_class));
+
+	return success;
+}
+
+/* @priority_class: 0 to keep the class of the process */
+
+static gboolean
+_set_thread_priority (DWORD priority_class, int priority)
+{
+	ArvWin32PriorityRequest request = {0};
+	HANDLE process = GetCurrentProcess ();
+	HANDLE thread = GetCurrentThread ();
+
+	request.requested_class = priority_class;
+	if (priority_class != 0) {
+		request.class_set = SetPriorityClass (process, priority_class);
+		if (!request.class_set)
+			request.class_error = GetLastError ();
+	}
+	request.granted_class = GetPriorityClass (process);
+
+	request.requested_priority = priority;
+	request.priority_set = SetThreadPriority (thread, priority);
+	if (!request.priority_set)
+		request.priority_error = GetLastError ();
+	request.granted_priority = GetThreadPriority (thread);
+
+	return arv_win32_check_priority_request (&request);
+}
+
+/* Windows: REALTIME_PRIORITY_CLASS for the process, THREAD_PRIORITY_TIME_CRITICAL for the thread; @priority is not
+ * used. Without the privilege to increase the scheduling priority, the process gets HIGH_PRIORITY_CLASS and keeps it,
+ * and the thread THREAD_PRIORITY_TIME_CRITICAL, which is base priority 15, the highest outside the realtime class: not
+ * realtime, so this returns FALSE. */
+
 gboolean
 arv_make_thread_realtime (int priority)
 {
-	SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
-	if(!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL))
-   {
-		DWORD err = GetLastError();
-		arv_warning_misc ("SetPriorityClass(..., THREAD_PRIORITY_TIME_CRITICAL) failed (%lu)", err);
-		return FALSE;
-	}
-	arv_info_misc ("Thread made realtime!");
-	return TRUE;
+	return _set_thread_priority (REALTIME_PRIORITY_CLASS, THREAD_PRIORITY_TIME_CRITICAL);
 }
 
+/* Windows: THREAD_PRIORITY_HIGHEST, in the class the process has; @nice_level is not used */
+
 gboolean
-arv_make_thread_high_priority (int priority)
+arv_make_thread_high_priority (int nice_level)
 {
-	if(!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST))
-   {
-		DWORD err = GetLastError();
-		arv_warning_misc ("SetPriorityClass(..., THREAD_PRIORITY_HIGHEST) failed (%lu)", err);
-		return FALSE;
-	}
-	arv_info_misc ("Thread made high-priority!");
-	return TRUE;
+	return _set_thread_priority (0, THREAD_PRIORITY_HIGHEST);
 }
 
 #else

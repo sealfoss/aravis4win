@@ -25,6 +25,7 @@
 #include <arvdebugprivate.h>
 #include <arvmiscprivate.h>
 #include <errno.h>
+#include <string.h>
 
 GQuark
 arv_network_error_quark (void)
@@ -34,6 +35,11 @@ arv_network_error_quark (void)
 
 #ifndef G_OS_WIN32
 	#include <ifaddrs.h>
+	#include <sys/ioctl.h>	/* For SIOCGIFMTU */
+	#include <unistd.h>
+	#if defined(__APPLE__) || defined(BSD)
+		#include <sys/sockio.h>
+	#endif
 #else
 	#include <winsock2.h>
 	#include <iphlpapi.h>
@@ -45,7 +51,17 @@ struct _ArvNetworkInterface{
 	struct sockaddr *netmask;
 	struct sockaddr *broadaddr;
 	char* name;
+	guint mtu;
 };
+
+static guint
+_sanitize_mtu (guint64 mtu)
+{
+	if (mtu < ARV_NETWORK_MINIMUM_MTU || mtu > ARV_NETWORK_MAXIMUM_MTU)
+		return 0;
+
+	return mtu;
+}
 
 #ifdef G_OS_WIN32
 
@@ -227,9 +243,8 @@ arv_enumerate_network_interfaces (void)
 						}
 						if (!match){
 							arv_warning_interface
-                                                                ("Failed to obtain netmask for %08"
-                                                                 G_GINT64_MODIFIER
-                                                                 "x (secondary address?), using 255.255.0.0.",
+                                                                ("Failed to obtain netmask for %08lx"
+                                                                 " (secondary address?), using 255.255.0.0.",
                                                                  ((struct sockaddr_in*)a->addr)->sin_addr.s_addr);
 							mask->sin_addr.s_addr = htonl(0xffff0000U);
 						}
@@ -250,6 +265,8 @@ arv_enumerate_network_interfaces (void)
 				a->name = (char *) g_malloc (asciiSize);
 				wcstombs (a->name, name, asciiSize);
 			}
+			/* 0xffffffff for the loopback interface, reported as unknown */
+			a->mtu = _sanitize_mtu (pAddrIter->Mtu);
 
 			ret = g_list_prepend(ret, a);
 		}
@@ -353,15 +370,41 @@ arv_gpollfd_finish_all (GPollFD *fds, guint nfds){
 
 #else /* not G_OS_WIN32 */
 
+static guint
+_get_interface_mtu (int socket_fd, const char *name)
+{
+#ifdef SIOCGIFMTU
+	struct ifreq ifr;
+
+	if (socket_fd < 0 || name == NULL || strlen (name) >= sizeof (ifr.ifr_name))
+		return 0;
+
+	memset (&ifr, 0, sizeof (ifr));
+	memcpy (ifr.ifr_name, name, strlen (name));
+
+	if (ioctl (socket_fd, SIOCGIFMTU, &ifr) != 0 || ifr.ifr_mtu <= 0)
+		return 0;
+
+	/* 65536 for the Linux loopback interface, reported as unknown */
+	return _sanitize_mtu (ifr.ifr_mtu);
+#else
+	return 0;
+#endif
+}
+
 GList*
 arv_enumerate_network_interfaces (void)
 {
 	struct ifaddrs *ifap = NULL;
 	struct ifaddrs *ifap_iter;
 	GList* ret=NULL;
+	int mtu_socket;
 
 	if (getifaddrs (&ifap) <0)
 		return NULL;
+
+	/* Socket for the MTU queries */
+	mtu_socket = socket (AF_INET, SOCK_DGRAM, 0);
 
 	for (ifap_iter = ifap; ifap_iter != NULL; ifap_iter = ifap_iter->ifa_next) {
 		if ((ifap_iter->ifa_flags & IFF_UP) != 0 &&
@@ -394,9 +437,14 @@ arv_enumerate_network_interfaces (void)
 			if (ifap_iter->ifa_name)
 				a->name = g_strdup(ifap_iter->ifa_name);
 
+			a->mtu = _get_interface_mtu (mtu_socket, ifap_iter->ifa_name);
+
 			ret = g_list_prepend (ret, a);
 		}
 	}
+
+	if (mtu_socket >= 0)
+		close (mtu_socket);
 
 	freeifaddrs (ifap);
 
@@ -447,6 +495,242 @@ arv_network_interface_get_name(ArvNetworkInterface* a)
 	return a->name;
 }
 
+guint
+arv_network_interface_get_mtu (ArvNetworkInterface *a)
+{
+	return a->mtu;
+}
+
+static gboolean
+_interface_has_address (ArvNetworkInterface *iface, GInetAddress *address)
+{
+	GSocketAddress *iface_socket_address;
+	gboolean is_equal = FALSE;
+
+	if (iface->addr == NULL)
+		return FALSE;
+
+	iface_socket_address = g_socket_address_new_from_native (iface->addr, sizeof (struct sockaddr));
+	if (G_IS_INET_SOCKET_ADDRESS (iface_socket_address))
+		is_equal = g_inet_address_equal (address,
+						 g_inet_socket_address_get_address
+						 (G_INET_SOCKET_ADDRESS (iface_socket_address)));
+	g_clear_object (&iface_socket_address);
+
+	return is_equal;
+}
+
+static gint arv_network_loopback_mtu_override = 0;
+
+/*
+ * arv_network_set_loopback_mtu_override:
+ * @mtu: MTU in bytes, 0 for the actual one
+ *
+ * Test hook, sets the MTU arv_network_get_interface_mtu_by_address() returns for loopback addresses. The loopback MTU
+ * is unknown on Linux and Windows, and the tests running the fake GigE camera on the loopback interface need a known
+ * MTU to exercise the code depending on it.
+ */
+
+void
+arv_network_set_loopback_mtu_override (guint mtu)
+{
+	g_atomic_int_set (&arv_network_loopback_mtu_override, (gint) _sanitize_mtu (mtu));
+}
+
+/*
+ * arv_network_get_interface_mtu_by_address:
+ * @address: an IP address of the host
+ *
+ * Returns: the MTU of the host network interface owning @address, in bytes, 0 if unknown or if no interface owns
+ * @address.
+ */
+
+guint
+arv_network_get_interface_mtu_by_address (GInetAddress *address)
+{
+	GList *ifaces;
+	GList *iface_iter;
+	guint mtu = 0;
+
+	g_return_val_if_fail (G_IS_INET_ADDRESS (address), 0);
+
+	if (g_inet_address_get_is_loopback (address)) {
+		mtu = (guint) g_atomic_int_get (&arv_network_loopback_mtu_override);
+		if (mtu > 0)
+			return mtu;
+	}
+
+	ifaces = arv_enumerate_network_interfaces ();
+
+	for (iface_iter = ifaces; iface_iter != NULL; iface_iter = iface_iter->next) {
+		ArvNetworkInterface *iface = iface_iter->data;
+
+		if (_interface_has_address (iface, address)) {
+			mtu = iface->mtu;
+			break;
+		}
+	}
+
+	g_list_free_full (ifaces, (GDestroyNotify) arv_network_interface_free);
+
+	return mtu;
+}
+
+/*
+ * arv_network_is_host_address:
+ * @address: an IP address
+ *
+ * Returns: %TRUE if @address is a loopback address, or the address of one of the network interfaces of the host.
+ * Traffic between two addresses of the host goes through the loopback interface.
+ */
+
+gboolean
+arv_network_is_host_address (GInetAddress *address)
+{
+	GList *ifaces;
+	GList *iface_iter;
+	gboolean is_host_address = FALSE;
+
+	g_return_val_if_fail (G_IS_INET_ADDRESS (address), FALSE);
+
+	if (g_inet_address_get_is_loopback (address))
+		return TRUE;
+
+	ifaces = arv_enumerate_network_interfaces ();
+
+	for (iface_iter = ifaces; iface_iter != NULL && !is_host_address; iface_iter = iface_iter->next)
+		is_host_address = _interface_has_address (iface_iter->data, address);
+
+	g_list_free_full (ifaces, (GDestroyNotify) arv_network_interface_free);
+
+	return is_host_address;
+}
+
+/*
+ * arv_network_address_is_on_subnet:
+ * @address: an IPv4 address
+ * @interface_address: the IPv4 address of a network interface
+ * @netmask: (nullable): the IPv4 netmask of the interface, %NULL if unknown
+ *
+ * Returns: %TRUE if @address belongs to the subnet of the interface, %FALSE if not, or if the netmask is unknown or
+ * null.
+ */
+
+gboolean
+arv_network_address_is_on_subnet (GInetAddress *address, GInetAddress *interface_address, GInetAddress *netmask)
+{
+	const guint8 *address_bytes;
+	const guint8 *interface_bytes;
+	const guint8 *netmask_bytes;
+	gboolean is_null_netmask = TRUE;
+	unsigned int i;
+
+	g_return_val_if_fail (G_IS_INET_ADDRESS (address), FALSE);
+	g_return_val_if_fail (G_IS_INET_ADDRESS (interface_address), FALSE);
+
+	if (!G_IS_INET_ADDRESS (netmask) ||
+	    g_inet_address_get_family (address) != G_SOCKET_FAMILY_IPV4 ||
+	    g_inet_address_get_family (interface_address) != G_SOCKET_FAMILY_IPV4 ||
+	    g_inet_address_get_family (netmask) != G_SOCKET_FAMILY_IPV4)
+		return FALSE;
+
+	address_bytes = g_inet_address_to_bytes (address);
+	interface_bytes = g_inet_address_to_bytes (interface_address);
+	netmask_bytes = g_inet_address_to_bytes (netmask);
+
+	for (i = 0; i < 4; i++) {
+		if ((address_bytes[i] & netmask_bytes[i]) != (interface_bytes[i] & netmask_bytes[i]))
+			return FALSE;
+		if (netmask_bytes[i] != 0)
+			is_null_netmask = FALSE;
+	}
+
+	return !is_null_netmask;
+}
+
+#define ARV_NETWORK_ETHERNET_HEADER_SIZE	14
+#define ARV_NETWORK_ETHERTYPE_IPV4		0x0800
+#define ARV_NETWORK_IPV4_MINIMUM_HEADER_SIZE	20
+#define ARV_NETWORK_IPV4_PROTOCOL_UDP		17
+#define ARV_NETWORK_IPV4_MORE_FRAGMENTS		0x2000
+#define ARV_NETWORK_IPV4_FRAGMENT_OFFSET_MASK	0x1fff
+#define ARV_NETWORK_UDP_HEADER_SIZE		8
+
+static guint
+_get_be16 (const guint8 *bytes)
+{
+	return ((guint) bytes[0] << 8) | bytes[1];
+}
+
+/*
+ * arv_network_ethernet_frame_get_udp_payload:
+ * @frame: an Ethernet frame, as captured by a packet socket
+ * @frame_size: the number of captured bytes of @frame
+ * @payload_size: (out): the size of the UDP payload, 0 if there is none
+ * @is_incomplete: (out) (optional): %TRUE if @frame carries only a part of an IPv4 UDP datagram: an IP fragment, or a
+ * capture shorter than the IP packet
+ *
+ * A packet socket sees the IPv4 packets before their reassembly: a UDP datagram larger than the MTU of the network path
+ * arrives in several IP fragments, and only the first one starts with the UDP header. The capture of a frame may also
+ * be shorter than the frame.
+ *
+ * Returns: the payload of the UDP datagram carried by @frame, %NULL if @frame doesn't carry a whole UDP datagram: not
+ * an IPv4 UDP packet, a malformed one, an IP fragment, or a capture shorter than the datagram.
+ */
+
+const void *
+arv_network_ethernet_frame_get_udp_payload (const void *frame, size_t frame_size, size_t *payload_size,
+					    gboolean *is_incomplete)
+{
+	const guint8 *ip;
+	const guint8 *udp;
+	size_t ip_header_size;
+	size_t ip_size;
+	size_t udp_size;
+
+	g_return_val_if_fail (payload_size != NULL, NULL);
+
+	*payload_size = 0;
+	if (is_incomplete != NULL)
+		*is_incomplete = FALSE;
+
+	if (frame == NULL ||
+	    frame_size < ARV_NETWORK_ETHERNET_HEADER_SIZE + ARV_NETWORK_IPV4_MINIMUM_HEADER_SIZE ||
+	    _get_be16 ((const guint8 *) frame + 12) != ARV_NETWORK_ETHERTYPE_IPV4)
+		return NULL;
+
+	ip = (const guint8 *) frame + ARV_NETWORK_ETHERNET_HEADER_SIZE;
+	ip_header_size = (ip[0] & 0x0f) * 4;
+	ip_size = _get_be16 (ip + 2);
+
+	if ((ip[0] >> 4) != 4 ||
+	    ip[9] != ARV_NETWORK_IPV4_PROTOCOL_UDP ||
+	    ip_header_size < ARV_NETWORK_IPV4_MINIMUM_HEADER_SIZE)
+		return NULL;
+
+	/* Any fragment, the first one included, carries only a part of the datagram, like a capture shorter than its
+	 * packet */
+	if ((_get_be16 (ip + 6) & (ARV_NETWORK_IPV4_MORE_FRAGMENTS | ARV_NETWORK_IPV4_FRAGMENT_OFFSET_MASK)) != 0 ||
+	    ip_size > frame_size - ARV_NETWORK_ETHERNET_HEADER_SIZE) {
+		if (is_incomplete != NULL)
+			*is_incomplete = TRUE;
+		return NULL;
+	}
+
+	if (ip_size < ip_header_size + ARV_NETWORK_UDP_HEADER_SIZE)
+		return NULL;
+
+	udp = ip + ip_header_size;
+	udp_size = _get_be16 (udp + 4);
+	if (udp_size < ARV_NETWORK_UDP_HEADER_SIZE ||
+	    udp_size > ip_size - ip_header_size)
+		return NULL;
+
+	*payload_size = udp_size - ARV_NETWORK_UDP_HEADER_SIZE;
+
+	return udp + ARV_NETWORK_UDP_HEADER_SIZE;
+}
+
 void
 arv_network_interface_free(ArvNetworkInterface *a)
 {
@@ -477,7 +761,7 @@ arv_socket_set_recv_buffer_size (int socket_fd, gint buffer_size)
 			     (const char *) &_buffer_size, sizeof (_buffer_size));
 	if(result != 0) {
 	    arv_warning_interface ("[set_recv_buffer_size] Setting socket buffer to %d bytes failed (%s)",
-                                  _buffer_size, strerror(errno));
+                                  buffer_size, strerror(errno));
 	    return FALSE;
 	}
 
@@ -502,7 +786,7 @@ arv_socket_set_recv_buffer_size (int socket_fd, gint buffer_size)
                                        buffer_size_reported, buffer_size);
 #else
                 arv_warning_interface ("[set_recv_buffer_size] Unexpected socket buffer size (SO_RCVBUF):"
-                                       " actual %d < expected %d bytes"
+                                       " actual %lu < expected %d bytes"
                                        "\nYou might see missing packets and timeouts",
                                        buffer_size_reported, buffer_size);
 #endif

@@ -370,6 +370,12 @@ arv_uvcp_packet_get_write_memory_cmd_data (const ArvUvcpPacket *packet)
 }
 
 static inline size_t
+arv_uvcp_packet_get_write_memory_cmd_size (size_t data_size)
+{
+	return sizeof (ArvUvcpWriteMemoryCmd) + data_size;
+}
+
+static inline size_t
 arv_uvcp_packet_get_write_memory_ack_size (void)
 {
 	return sizeof (ArvUvcpWriteMemoryAck);

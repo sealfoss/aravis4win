@@ -125,6 +125,16 @@ extern ArvDebugCategoryInfos arv_debug_category_infos[];
 
 gboolean	arv_debug_check			(ArvDebugCategory category, ArvDebugLevel level);
 
+/* private, but exported for the tests */
+typedef gboolean (*ArvDebugQueryFunc)	(void);
+
+ARV_API gboolean	arv_debug_use_glyphs		(guint console_output_cp, gboolean stderr_is_console,
+							 guint crt_code_page,
+							 ArvDebugQueryFunc console_charset_is_utf8,
+							 ArvDebugQueryFunc console_has_terminal);
+ARV_API gboolean	arv_debug_is_terminal		(const char *console_window_class, const char *wt_session,
+							 const char *term_program);
+
 /* private, but used by viewer */
 ARV_API void	arv_warning 			(ArvDebugCategory category, const char *format, ...) G_GNUC_PRINTF (2,3);
 ARV_API void	arv_info 			(ArvDebugCategory category, const char *format, ...) G_GNUC_PRINTF (2,3);

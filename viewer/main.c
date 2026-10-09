@@ -42,6 +42,7 @@ static unsigned int arv_viewer_option_initial_packet_timeout = ARV_GV_STREAM_INI
 static unsigned int arv_viewer_option_packet_timeout = ARV_GV_STREAM_PACKET_TIMEOUT_US_DEFAULT / 1000;
 static unsigned int arv_viewer_option_frame_retention = ARV_GV_STREAM_FRAME_RETENTION_US_DEFAULT / 1000;
 static char *arv_option_uv_usb_mode = NULL;
+static gboolean arv_viewer_option_gentl = FALSE;
 static gboolean arv_option_show_version = FALSE;
 
 static const GOptionEntry arv_viewer_option_entries[] =
@@ -80,6 +81,11 @@ static const GOptionEntry arv_viewer_option_entries[] =
 		"usb-mode",				's', 0, G_OPTION_ARG_STRING,
 		&arv_option_uv_usb_mode,		"USB device I/O mode",
 		"{sync|async}"
+	},
+	{
+		"gentl",				'\0', 0, G_OPTION_ARG_NONE,
+		&arv_viewer_option_gentl,		"Enable the GenTL interface",
+		NULL
 	},
 	{
 		"debug", 				'd', 0, G_OPTION_ARG_STRING,
@@ -185,6 +191,9 @@ main (int argc, char **argv)
 			arv_debug_print_infos ();
 		return EXIT_FAILURE;
 	}
+
+	if (arv_viewer_option_gentl)
+		arv_enable_interface ("GenTL");
 
 	viewer = arv_viewer_new ();
 	if (!ARV_IS_VIEWER (viewer))
