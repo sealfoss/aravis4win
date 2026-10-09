@@ -38,6 +38,8 @@
 /* Device id built from the producer file name, the GenTL interface id and the GenTL device id, when the producer
  * tells no string at all */
 #define MOCK_NO_STRING_DEVICE_ID	"ArvGenTLMock---ArvGenTLMock" MOCK_NO_SERIAL_ID_SUFFIX ("0")
+#define MOCK_NO_SERIAL_ID_PREFIX	ARV_GENTL_MOCK_TL_VENDOR "-" ARV_GENTL_MOCK_VENDOR "-" ARV_GENTL_MOCK_MODEL \
+					"-ArvGenTLMock-"
 
 #define MOCK_FRAME_PERIOD_US		"10000"
 #define FRAME_TIMEOUT_US		(10 * G_USEC_PER_SEC)
@@ -169,6 +171,7 @@ typedef struct {
 	ArvGenTLMockGetCounter get_counter;
 	ArvGenTLMockGetLastViolation get_last_violation;
 	ArvGenTLMockSetOption set_option;
+	ArvGenTLMockSetIds set_ids;
 	ArvGenTLMockResetCounters reset_counters;
 } MockControl;
 
@@ -187,6 +190,8 @@ mock_control_new (const char *path)
 					(gpointer *) &control->get_last_violation));
 	g_assert_true (g_module_symbol (control->module, ARV_GENTL_MOCK_SET_OPTION,
 					(gpointer *) &control->set_option));
+	g_assert_true (g_module_symbol (control->module, ARV_GENTL_MOCK_SET_IDS,
+					(gpointer *) &control->set_ids));
 	g_assert_true (g_module_symbol (control->module, ARV_GENTL_MOCK_RESET_COUNTERS,
 					(gpointer *) &control->reset_counters));
 
@@ -668,14 +673,15 @@ copy_producer (const char *source_path, const char *directory, const char *basen
 }
 
 static void
-missing_serial_number_producers_test (void)
+check_missing_serial_number_producers (const char *const basenames[2], const char *const interface_ids[2],
+				      const char *const expected_ids[2])
 {
 	MockControl *controls[2];
 	GPtrArray *ids;
 	GError *error = NULL;
 	const char *mock_path;
 	char *directory;
-	char *copy_path;
+	char *paths[2];
 	char *gentl_path;
 	guint producers[2] = {0, 0};
 	guint i;
@@ -684,11 +690,12 @@ missing_serial_number_producers_test (void)
 
 	directory = g_dir_make_tmp ("arv-gentl-test-XXXXXX", &error);
 	g_assert_no_error (error);
-	copy_path = copy_producer (mock_path, directory, "ArvGenTLMockCopy.cti");
-	gentl_path = g_strjoin (G_SEARCHPATH_SEPARATOR_S, mock_path, copy_path, NULL);
-
-	controls[0] = mock_control_new (mock_path);
-	controls[1] = mock_control_new (copy_path);
+	for (i = 0; i < 2; i++) {
+		paths[i] = basenames[i] != NULL ? copy_producer (mock_path, directory, basenames[i]) :
+						g_strdup (mock_path);
+		controls[i] = mock_control_new (paths[i]);
+	}
+	gentl_path = g_strjoin (G_SEARCHPATH_SEPARATOR_S, paths[0], paths[1], NULL);
 
 	setup_environment (gentl_path);
 	g_setenv ("ARV_GENTL_MOCK_MISSING_INFO", "DEVICE_INFO_SERIAL_NUMBER", TRUE);
@@ -697,10 +704,17 @@ missing_serial_number_producers_test (void)
 	arv_update_device_list ();
 	g_assert_cmpint (controls[0]->get_counter ("GCInitLib"), ==, 1);
 	g_assert_cmpint (controls[1]->get_counter ("GCInitLib"), ==, 1);
+	if (interface_ids[0] != NULL || interface_ids[1] != NULL) {
+		for (i = 0; i < 2; i++)
+			if (interface_ids[i] != NULL)
+				g_assert_true (controls[i]->set_ids (0, interface_ids[i], NULL));
+		arv_update_device_list ();
+	}
 
 	/* The producers are listed in an arbitrary order */
 	ids = dup_mock_device_ids ();
 	g_assert_cmpuint (ids->len, ==, 2);
+	g_assert_cmpstr (g_ptr_array_index (ids, 0), !=, g_ptr_array_index (ids, 1));
 	for (i = 0; i < ids->len; i++) {
 		ArvDevice *device;
 
@@ -710,6 +724,8 @@ missing_serial_number_producers_test (void)
 
 		producers[i] = controls[0]->get_counter ("open-devices") == 1 ? 0 : 1;
 		g_assert_cmpint (controls[producers[i]]->get_counter ("open-devices"), ==, 1);
+		g_assert_cmpint (controls[1 - producers[i]]->get_counter ("open-devices"), ==, 0);
+		g_assert_cmpstr (g_ptr_array_index (ids, i), ==, expected_ids[producers[i]]);
 
 		g_test_message ("Listed device %u: '%s' opens the camera of producer %u", i,
 				(const char *) g_ptr_array_index (ids, i), producers[i]);
@@ -717,30 +733,119 @@ missing_serial_number_producers_test (void)
 		g_object_unref (device);
 	}
 
-	g_assert_cmpstr (g_ptr_array_index (ids, 0), !=, g_ptr_array_index (ids, 1));
 	g_assert_cmpuint (producers[0], !=, producers[1]);
-	for (i = 0; i < ids->len; i++)
-		g_assert_cmpstr (g_ptr_array_index (ids, i), ==,
-				 producers[i] == 0 ?
-				 MOCK_NO_SERIAL_DEVICE_ID :
-				 ARV_GENTL_MOCK_TL_VENDOR "-" ARV_GENTL_MOCK_VENDOR "-" ARV_GENTL_MOCK_MODEL
-				 "-ArvGenTLMockCopy" MOCK_NO_SERIAL_ID_SUFFIX ("0"));
 
 	g_ptr_array_unref (ids);
 
 	teardown_environment ();
 
-	assert_no_violation (controls[0]);
-	assert_no_violation (controls[1]);
-	mock_control_free (controls[0]);
-	mock_control_free (controls[1]);
-
-	/* Best effort, the library may still be mapped */
-	g_unlink (copy_path);
+	for (i = 0; i < 2; i++) {
+		assert_no_violation (controls[i]);
+		mock_control_free (controls[i]);
+		/* Best effort, the library may still be mapped */
+		if (basenames[i] != NULL)
+			g_unlink (paths[i]);
+		g_free (paths[i]);
+	}
 	g_rmdir (directory);
 	g_free (gentl_path);
-	g_free (copy_path);
 	g_free (directory);
+}
+
+static void
+missing_serial_number_producers_test (void)
+{
+	static const char *basenames[] = {NULL, "ArvGenTLMockCopy.cti"};
+	static const char *interface_ids[] = {NULL, NULL};
+	static const char *expected_ids[] = {
+		MOCK_NO_SERIAL_DEVICE_ID,
+		ARV_GENTL_MOCK_TL_VENDOR "-" ARV_GENTL_MOCK_VENDOR "-" ARV_GENTL_MOCK_MODEL
+			"-ArvGenTLMockCopy" MOCK_NO_SERIAL_ID_SUFFIX ("0")
+	};
+
+	check_missing_serial_number_producers (basenames, interface_ids, expected_ids);
+}
+
+/* Joining Arv-Q/A0 and Arv/Q-A0 without escaping gave both cameras the same id. */
+static void
+missing_serial_number_producer_separators_test (void)
+{
+	static const char *basenames[] = {"Arv-Q.cti", "Arv.cti"};
+	static const char *interface_ids[] = {"A0", "Q-A0"};
+	static const char *expected_ids[] = {
+		ARV_GENTL_MOCK_TL_VENDOR "-" ARV_GENTL_MOCK_VENDOR "-" ARV_GENTL_MOCK_MODEL
+			"-Arv%2DQ-A0-MockDevice0",
+		ARV_GENTL_MOCK_TL_VENDOR "-" ARV_GENTL_MOCK_VENDOR "-" ARV_GENTL_MOCK_MODEL
+			"-Arv-Q%2DA0-MockDevice0"
+	};
+
+	check_missing_serial_number_producers (basenames, interface_ids, expected_ids);
+}
+
+typedef struct {
+	const char *interface_ids[2];
+	const char *device_ids[2];
+	const char *expected_suffixes[2];
+} MockIdentityPair;
+
+static const MockIdentityPair encoded_identity_pairs[] = {
+	/* Moving the separator between the interface and device used to preserve the canonical id. */
+	{{"A-B", "A"}, {"C", "B-C"}, {"A%2DB-C", "A-B%2DC"}},
+	/* A literal escape sequence must differ from the character it would encode. */
+	{{"A%2DB", "A-B"}, {"Device%0", "Device%0"}, {"A%252DB-Device%250", "A%2DB-Device%250"}},
+	/* The later control-character stripping must not merge distinct opaque ids. */
+	{{"A\001B", "AB"}, {"D\037X", "D\037X"}, {"A%01B-D%1FX", "AB-D%1FX"}},
+	/* Encode UTF-8 bytes, spaces and slashes; leave the safe ASCII punctuation unchanged. */
+	{{"A_\303\251.~", "A_%C3%A9.~"}, {"D /\342\202\254", "D%20%2F%E2%82%AC"},
+	 {"A_%C3%A9.~-D%20%2F%E2%82%AC", "A_%25C3%25A9.~-D%2520%252F%25E2%2582%25AC"}}
+};
+
+static void
+missing_serial_number_encoded_ids_test (gconstpointer data)
+{
+	const MockIdentityPair *pair = data;
+	MockControl *control;
+	GPtrArray *ids;
+	GPtrArray *cameras;
+	const char *mock_path;
+	guint i, j;
+
+	GET_TEST_PATH_OR_SKIP (mock_path, "ARV_TEST_GENTL_MOCK");
+
+	control = mock_control_new (mock_path);
+	setup_environment (mock_path);
+	g_setenv ("ARV_GENTL_MOCK_N_INTERFACES", "2", TRUE);
+	g_setenv ("ARV_GENTL_MOCK_MISSING_INFO", "DEVICE_INFO_SERIAL_NUMBER", TRUE);
+	arv_enable_interface ("GenTL");
+	arv_update_device_list ();
+	for (i = 0; i < 2; i++)
+		g_assert_true (control->set_ids (i, pair->interface_ids[i], pair->device_ids[i]));
+	arv_update_device_list ();
+
+	ids = dup_mock_device_ids ();
+	g_assert_cmpuint (ids->len, ==, 2);
+	g_assert_cmpstr (g_ptr_array_index (ids, 0), !=, g_ptr_array_index (ids, 1));
+	cameras = dup_reached_cameras (ids);
+	for (i = 0; i < 2; i++) {
+		char *expected = g_strconcat (MOCK_NO_SERIAL_ID_PREFIX, pair->expected_suffixes[i], NULL);
+
+		/* Aravis sorts the list by id, which can change the order of the interfaces after encoding. */
+		for (j = 0; j < ids->len; j++)
+			if (g_strcmp0 (g_ptr_array_index (ids, j), expected) == 0)
+				break;
+		g_assert_cmpuint (j, <, ids->len);
+		g_assert_cmpstr (g_ptr_array_index (cameras, j), ==,
+				i == 0 ? ARV_GENTL_MOCK_SERIAL "0" : ARV_GENTL_MOCK_SERIAL "0-IF1");
+		g_assert_cmpstr (arv_get_device_serial_nbr (find_device (expected)), ==, "");
+		g_test_message ("Listed '%s' opens camera '%s'", expected,
+				(const char *) g_ptr_array_index (cameras, j));
+		g_free (expected);
+	}
+	g_ptr_array_unref (cameras);
+	g_ptr_array_unref (ids);
+	teardown_environment ();
+	assert_no_violation (control);
+	mock_control_free (control);
 }
 
 /* A producer without the functions the consumer never calls, or can do without, is loaded and streams */
@@ -3326,6 +3431,16 @@ main (int argc, char *argv[])
 	g_test_add_func ("/gentl/discovery/interfaces-same-device-id", interfaces_same_device_id_test);
 	g_test_add_func ("/gentl/discovery/missing-serial-number-interfaces", missing_serial_number_interfaces_test);
 	g_test_add_func ("/gentl/discovery/missing-serial-number-producers", missing_serial_number_producers_test);
+	g_test_add_func ("/gentl/discovery/missing-serial-number-producer-separators",
+			 missing_serial_number_producer_separators_test);
+	g_test_add_data_func ("/gentl/discovery/missing-serial-number-interface-device-separators",
+			      &encoded_identity_pairs[0], missing_serial_number_encoded_ids_test);
+	g_test_add_data_func ("/gentl/discovery/missing-serial-number-percent-identifiers",
+			      &encoded_identity_pairs[1], missing_serial_number_encoded_ids_test);
+	g_test_add_data_func ("/gentl/discovery/missing-serial-number-control-identifiers",
+			      &encoded_identity_pairs[2], missing_serial_number_encoded_ids_test);
+	g_test_add_data_func ("/gentl/discovery/missing-serial-number-utf8-identifiers",
+			      &encoded_identity_pairs[3], missing_serial_number_encoded_ids_test);
 	g_test_add_func ("/gentl/load/optional-functions", optional_functions_test);
 	g_test_add_func ("/gentl/load/missing-function", missing_function_test);
 	g_test_add_func ("/gentl/load/invalid-producer", invalid_producer_test);

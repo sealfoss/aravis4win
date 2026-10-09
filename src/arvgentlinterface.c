@@ -236,6 +236,33 @@ _get_producer_name (ArvGenTLSystem *gentl_system)
 	return basename;
 }
 
+/* Keep the three fallback components distinct even when they contain the separator, an escape sequence or bytes
+ * that arv_str_strip() would remove from the resulting device name. Escape bytes, not Unicode code points, so the
+ * producer's opaque identifiers are preserved. The raw identifiers used to open the interface/device are unchanged. */
+
+static char *
+_make_fallback_serial (const char *producer, const char *interface_id, const char *device_id)
+{
+	const char *components[] = {producer, interface_id, device_id};
+	GString *serial = g_string_new (NULL);
+	guint i;
+
+	for (i = 0; i < G_N_ELEMENTS (components); i++) {
+		const guchar *p = (const guchar *) components[i];
+
+		if (i > 0)
+			g_string_append_c (serial, '-');
+		for (; *p != '\0'; p++) {
+			if (g_ascii_isalnum (*p) || *p == '_' || *p == '.' || *p == '~')
+				g_string_append_c (serial, *p);
+			else
+				g_string_append_printf (serial, "%%%02X", (unsigned int) *p);
+		}
+	}
+
+	return g_string_free (serial, FALSE);
+}
+
 static uint32_t
 _gentl_refresh(GC_ERROR(*update)(void*, bool8_t *, uint64_t), GC_ERROR(*get)(void*, uint32_t*), void *handle)
 {
@@ -354,8 +381,7 @@ _discover (ArvGenTLInterface *gentl_interface, GArray *device_ids)
 				if (serial_nbr[0] != '\0')
 					id_serial_nbr = g_strdup (serial_nbr);
 				else
-					id_serial_nbr = g_strdup_printf ("%s-%s-%s", producer_name, interface_id,
-									 device_id);
+					id_serial_nbr = _make_fallback_serial (producer_name, interface_id, device_id);
 
 				device_infos =  arv_gentl_interface_device_infos_new(gentl_system, tl_vendor, interface_id, id,
                                                                                     vendor, model, id_serial_nbr);

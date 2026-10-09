@@ -449,7 +449,7 @@ The failures that the plan reproduced against a mock producer, and their tests:
 
 **Tests.**
 
-- `gentl` (suite `gentl`, 43 cases) against the mock producers of `tests/gentlmock`: `ArvGenTLMock`, `ArvGenTLMockMinimal`, `ArvGenTLMockBroken`, and `ArvGenTLMockDep` on Windows.
+- `gentl` (suite `gentl`, 52 cases on Windows, 51 elsewhere) against the mock producers of `tests/gentlmock`: `ArvGenTLMock`, `ArvGenTLMockMinimal`, `ArvGenTLMockBroken`, and `ArvGenTLMockDep` on Windows.
 - Groups: `/gentl/opt-in/*`, `/gentl/load/*` (including `dependency`), `/gentl/discovery/*`, `/gentl/open/*`, `/gentl/acquisition/basic`, `/gentl/shutdown/*`, `/gentl/stream/*`, `/gentl/device/*` (`-Devent=true`), `/gentl/producer/*` (`-Dgentl-producer=true`), `/gentl/utilities/*`.
 - `gstaravis` gentl and interface tcases. Unclamping the received size made `/gentl/stream/oversized-frame` fail.
 
@@ -469,7 +469,7 @@ The failures that the plan reproduced against a mock producer, and their tests:
 **Audit follow-up.**
 
 - The single-part fallback of `src/arvgentlstream.c` gave the image part the whole `BUFFER_INFO_DATA_SIZE` at offset `BUFFER_INFO_IMAGEOFFSET`, so a frame with a nonzero image offset that filled its buffer became `SIZE_MISMATCH`. The part now ends with the data: `DATA_SIZE - IMAGEOFFSET`. `aravissrc` sends that image part rather than the whole buffer, so the bytes before the image do not shift the frame. Tests: `/gentl/stream/image-offset` (mock option `ARV_GENTL_MOCK_IMAGE_OFFSET`, fallback and multi-part paths) and `test_gentl_image_offset`, which checks the content of the frames `aravissrc` sends.
-- The missing-serial fallback of `src/arvgentlinterface.c` used the GenTL device id alone, so devices of two interfaces, or of two producers of one vendor, could share an Aravis id: one camera could not be opened, and its entry opened the other. The fallback now adds the producer and the interface (`gentl.md`). Tests: `/gentl/discovery/missing-serial-number-interfaces`, `missing-serial-number-producers`, `interfaces-same-device-id` (mock option `ARV_GENTL_MOCK_N_INTERFACES`).
+- The missing-serial fallback of `src/arvgentlinterface.c` used the GenTL device id alone, so devices of two interfaces, or of two producers of one vendor, could share an Aravis id: one camera could not be opened, and its entry opened the other. The fallback now adds the producer and the interface (`gentl.md`). Each component is percent-encoded before joining with hyphens, so embedded hyphens, percent signs and control bytes cannot merge different tuples. ASCII letters, digits, `_`, `.` and `~` remain unchanged; other bytes use uppercase `%HH`. Simple fallback ids and ids with supplied serial numbers keep their spelling. Tests: `/gentl/discovery/missing-serial-number-interfaces`, `missing-serial-number-producers`, `interfaces-same-device-id` (mock option `ARV_GENTL_MOCK_N_INTERFACES`); the re-audit follow-up below covers encoded components.
 
 ### 9. The GStreamer plugin is never built with MSVC upstream
 
@@ -891,10 +891,22 @@ An external audit of `8d517b7a` reported six findings, read from the source only
 | --- | --- | --- | --- | --- | --- |
 | 1 (P2) | `src/arvuvstream.c`, `src/arvuvdevice.c` | A failed RAW_IO disable at stop left the policy on; the next acquisition without RAW_IO got every read rejected, silently | The device tracks the actual policy; a start without RAW_IO turns it off first, or fails | `/fakeuvrawio/failed-disable*` | P3: needs a policy change to fail on a plugged camera, on the opt-in RAW_IO path |
 | 2 (P2) | `src/arvgentlstream.c` | A nonzero `BUFFER_INFO_IMAGEOFFSET` made complete single-part frames `SIZE_MISMATCH` | Image part size `DATA_SIZE - IMAGEOFFSET`; `aravissrc` sends the image part | `/gentl/stream/image-offset`, `test_gentl_image_offset` (frame content) | P2: every frame of such a producer is lost |
-| 3 (P2) | `src/arvgentlinterface.c` | Without serial numbers, devices of two interfaces or two producers shared an Aravis id: one could not be opened, and its entry opened the other | Producer and interface in the fallback id | `/gentl/discovery/missing-serial-number-interfaces`, `-producers`, `interfaces-same-device-id` | P2 |
+| 3 (P2) | `src/arvgentlinterface.c` | Without serial numbers, devices of two interfaces or two producers shared an Aravis id: one could not be opened, and its entry opened the other | Producer and interface in the fallback id; components escaped after the re-audit below | `/gentl/discovery/missing-serial-number-interfaces`, `-producers`, `interfaces-same-device-id`, and the encoding cases below | P2 |
 | 4 (P2) | `gst/gstaravisdeviceprovider.c` | The provider deduplicated by device id only, hiding a camera with the same id on another interface | Key on (interface, device id) | `/fakeuvgst/provider-same-id-two-interfaces` (`fakeuvgst-network`) | P3: needs the same vendor, model and serial on two transports |
 | 5 (P3) | `.github/scripts/package-windows.py`, workflows | Fork zips named upstream as their source | `--source-url` from the workflow | `package-windows` | P3 |
 | 6 (P3) | `src/arvgvdevice.c`, `src/arvcamera.c`, docs | "Never exceeds the MTU" was false when the camera's smallest packet size is larger, and the log said the size fit | Corrected wording in every place, truthful info line, a warning when no size fits | `/gvpacketsize/mtu-below-minimum`, `/fakegvmtu/mtu-below-minimum` | P3 |
+
+### From the v030 re-audit of 9 October 2026
+
+The re-audit of `573b2271` found that finding 3 was only partly fixed: joining producer, interface and device ids with unescaped hyphens still merged different tuples. `Arv-Q.cti` / `A0` / `MockDevice0` and `Arv.cti` / `Q-A0` / `MockDevice0` listed the same id, and both entries opened one camera.
+
+`src/arvgentlinterface.c` now escapes each fallback component before joining it. Only ASCII letters, digits, `_`, `.` and `~` remain literal; other bytes use uppercase `%HH`, including hyphens, percent signs, control bytes and UTF-8 bytes. The example now yields `Arv%2DQ-A0-MockDevice0` and `Arv-Q%2DA0-MockDevice0`, and each opens its own camera. The raw producer identifiers used to open interfaces/devices are preserved. The compatibility change for special-character fallback ids is documented in `gentl.md`; supplied serial numbers and simple fallback components retain their spelling.
+
+Five regressions were added under `/gentl/discovery/missing-serial-number-`: `producer-separators`, `interface-device-separators`, `percent-identifiers`, `control-identifiers` and `utf8-identifiers`. They check unique/exact ids and the actual cameras reached, independently of device-list sorting. A mock-only `arv_gentl_mock_set_ids()` control changes opaque ids between discoveries without changing the cameras' serial registers. The tests use ordinary compiled mock producers, without binary patching.
+
+Validation on the MSVC debug shared build: compilation passed; the full `gentl` program passed 46 cases with six configuration skips (four Aravis-producer cases and two event cases); `gstaravis` passed all 50 checks; `doc-pages` passed. All five new regressions were also run against the preserved, unmodified `573b2271` Aravis DLL and failed on duplicate ids, missing encoded ids or the wrong opened camera. With the rebuilt DLL, all five pass. Local evidence is in `build-msvc/meson-logs/gentl-id-fix-final.*`, `gentl-id-fix.*` (GStreamer/docs), and `build-msvc/audit-v030/id-regressions-before.json`.
+
+The documented same-basename producer-copy and raw device-id alias limitations remain. No hardware or other-platform validation was added in this follow-up.
 
 ## Build, CI and packaging
 
@@ -1183,7 +1195,7 @@ The setup comes first. Each other entry is a Done-when of the plan that could no
 - GigE: the MTU check runs before the camera reads back the packet size it accepted. A camera that rounds a written size up can end above the MTU without the warning.
 - USB: the RAW_IO record starts as "off" when a device opens. libusb claims the stream interface through `WinUsb_GetAssociatedInterface`, and Microsoft documents the policy reset only for `WinUsb_Initialize`. If WinUSB keeps RAW_IO on across a close, the first acquisition without RAW_IO after a reopen would get no frames. This needs a camera to settle.
 - The device provider now lists a camera id found on two interfaces twice, with identical display names; only `aravis.interface` and `aravis.protocol` differ.
-- `/gentl/discovery/missing-serial-number-producers` loads a producer copied into the system temp folder, so it fails where that folder is mounted `noexec`.
+- The `/gentl/discovery/missing-serial-number-producers` and `missing-serial-number-producer-separators` tests load producers copied into the system temp folder, so they fail where that folder is mounted `noexec`.
 - With GLib 2.82 on Windows, a process that loads GIO sometimes loses its unflushed stdout at exit, in about 5% of runs. `arv-camera-test` can lose its final stream statistics that way.
 - In MSVC debug (`/MDd`) builds, only `tests/debug.c` turns off the C runtime's dialogs. Another test that fails inside the debug C runtime may wait on a dialog until meson's timeout. Seen once: a deliberately failing `uvlibusb` with `ARV_DEBUG` in the static `/MDd` build; the cause was not investigated.
 

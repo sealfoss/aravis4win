@@ -84,6 +84,10 @@
  *
  *   const char *arv_gentl_mock_get_last_violation (void);
  *   gboolean arv_gentl_mock_set_option (const char *name, const char *value);  NULL value restores the default
+ *   gboolean arv_gentl_mock_set_ids (guint interface_index, const char *interface_id, const char *device_id);
+ *       Changes the interface id and the id of its first device between discoveries, while the producer is
+ *       initialized with no open transport layer. NULL leaves that id unchanged; the camera serial numbers stay
+ *       unchanged, so a test can tell which camera an id reaches. Nonempty interface ids must fit in 32 bytes.
  *   void arv_gentl_mock_reset_counters (void);
  */
 
@@ -113,11 +117,14 @@ G_BEGIN_DECLS
 #define ARV_GENTL_MOCK_GET_COUNTER		"arv_gentl_mock_get_counter"
 #define ARV_GENTL_MOCK_GET_LAST_VIOLATION	"arv_gentl_mock_get_last_violation"
 #define ARV_GENTL_MOCK_SET_OPTION		"arv_gentl_mock_set_option"
+#define ARV_GENTL_MOCK_SET_IDS		"arv_gentl_mock_set_ids"
 #define ARV_GENTL_MOCK_RESET_COUNTERS		"arv_gentl_mock_reset_counters"
 
 typedef int		(*ArvGenTLMockGetCounter)		(const char *name);
 typedef const char *	(*ArvGenTLMockGetLastViolation)		(void);
 typedef gboolean	(*ArvGenTLMockSetOption)		(const char *name, const char *value);
+typedef gboolean	(*ArvGenTLMockSetIds)		(guint interface_index, const char *interface_id,
+							 const char *device_id);
 typedef void		(*ArvGenTLMockResetCounters)		(void);
 
 G_END_DECLS

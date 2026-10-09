@@ -55,6 +55,8 @@ __declspec(dllimport) int arv_gentl_mock_helper_get_answer (void);
 ARV_API int		arv_gentl_mock_get_counter		(const char *name);
 ARV_API const char *	arv_gentl_mock_get_last_violation	(void);
 ARV_API gboolean	arv_gentl_mock_set_option		(const char *name, const char *value);
+ARV_API gboolean	arv_gentl_mock_set_ids			(guint interface_index, const char *interface_id,
+								 const char *device_id);
 ARV_API void		arv_gentl_mock_reset_counters		(void);
 
 /* GenTL functions, in the order of src/arvgentlprivate.h */
@@ -2899,6 +2901,51 @@ const char *
 arv_gentl_mock_get_last_violation (void)
 {
 	return mock_last_violation;
+}
+
+gboolean
+arv_gentl_mock_set_ids (guint interface_index, const char *interface_id, const char *device_id)
+{
+	MockInterface *interface;
+	MockDevice *device;
+	gboolean success = FALSE;
+	guint i;
+
+	g_return_val_if_fail (interface_id != NULL || device_id != NULL, FALSE);
+
+	g_mutex_lock (&mock_mutex);
+
+	/* No producer handles may cache the old ids. */
+	if (!mock_is_initialized || mock_system_is_open || interface_index >= mock_n_interfaces)
+		goto out;
+
+	interface = &mock_interfaces[interface_index];
+	device = mock_get_interface_device (interface, 0);
+	if (interface_id != NULL) {
+		if (interface_id[0] == '\0' || strlen (interface_id) >= sizeof (interface->id))
+			goto out;
+		for (i = 0; i < mock_n_interfaces; i++)
+			if (i != interface_index && g_strcmp0 (mock_interfaces[i].id, interface_id) == 0)
+				goto out;
+	}
+	if (device_id != NULL) {
+		MockDevice *other = mock_find_device (interface, device_id);
+
+		if (device == NULL || device_id[0] == '\0' || (other != NULL && other != device))
+			goto out;
+	}
+
+	if (interface_id != NULL)
+		g_strlcpy (interface->id, interface_id, sizeof (interface->id));
+	if (device_id != NULL) {
+		g_free (device->id);
+		device->id = g_strdup (device_id);
+	}
+	success = TRUE;
+
+out:
+	g_mutex_unlock (&mock_mutex);
+	return success;
 }
 
 gboolean
